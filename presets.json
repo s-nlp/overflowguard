@@ -1,0 +1,142 @@
+{
+  "Binary Alphabet": {
+    "context": "When considering computational problems, a problem instance is a string over an alphabet. Usually, the alphabet is taken to be the binary alphabet (i.e., the set {0,1}), and thus the strings are bitstrings. As in a real-world computer, mathematical objects other than bitstrings must be suitably encoded. For example, integers can be represented in binary notation, and graphs can be encoded directly via their adjacency matrices, or by encoding their adjacency lists in binary.",
+    "query": [
+      "What is the name of the alphabet is most commonly used in a problem instance?"
+    ],
+    "gold": "binary alphabet",
+
+    "n_chunks": 1,
+    "results": {
+      "PISCO": {
+        "answer": "The binary alphabet is most commonly used in problem instances in computational complexity theory.",
+        "full_answer": "The most commonly used alphabet in a problem instance for computational problems is the binary alphabet, which consists of the set {0,1}.",
+        "latency": 280,
+        "context_tokens": 69,
+        "tokens_compressed": 69,
+        "clf_prob": 0.13,
+        "faithfulness": 95,
+        "tokens_saved": 97,
+        "tokens_full": 166,
+        "compression_ratio": "11.3×",
+        "matches_gold": true
+      },
+      "OSCAR": {
+        "answer": "The most commonly used alphabet in a problem instance is the binary alphabet, which consists of the set {0, 1}.",
+        "full_answer": "The most commonly used alphabet in a problem instance for computational problems is the binary alphabet, which consists of the set {0,1}.",
+        "latency": 430,
+        "context_tokens": 69,
+        "tokens_compressed": 69,
+        "clf_prob": 0.04,
+        "faithfulness": 98,
+        "tokens_saved": 97,
+        "tokens_full": 166,
+        "compression_ratio": "5.6×",
+        "matches_gold": true
+      },
+      "xRAG": {
+        "answer": "the alphabet used in the problem instance is the set of symbols that are used to represent the input to the problem. For example, in the problem of finding the shortest path between two nodes in a graph, the input is a set of edges and their weights, and the alphabet is the set of symbols that",
+        "latency": 980,
+        "context_tokens": 62,
+        "tokens_compressed": 69,
+        "clf_prob": 0.22,
+        "faithfulness": 30,
+        "tokens_saved": 89,
+        "tokens_full": 166,
+        "compression_ratio": "90×",
+        "matches_gold": false
+      }
+    }
+  },
+  "Norman Invasion": {
+    "context": "The Normans had a profound effect on Irish culture and history after their invasion at Bannow Bay in 1169. Initially the Normans maintained a distinct culture and ethnicity. Yet, with time, they came to be subsumed into Irish culture to the point that it has been said that they became \"more Irish than the Irish themselves.\" The Normans settled mostly in an area in the east of Ireland, later known as the Pale, and also built many fine castles and settlements, including Trim Castle and Dublin Castle. Both cultures intermixed, borrowing from each other's language, culture and outlook. Norman descendants today can be recognised by their surnames. Names such as French, (De) Roche, Devereux, D'Arcy, Treacy and Lacy are particularly common in the southeast of Ireland, especially in the southern part of County Wexford where the first Norman settlements were established. Other Norman names such as Furlong predominate there. Another common Norman-Irish name was Morell (Murrell) derived from the French Norman name Morel. Other names beginning with Fitz (from the Norman for son) indicate Norman ancestry. These included Fitzgerald, FitzGibbons (Gibbons) dynasty, Fitzmaurice. Other families bearing such surnames as Barry (de Barra) and De Búrca (Burke) are also of Norman extraction.",
+    "query": "In what year did the Norman's invade at Bannow Bay?",
+    "gold": "1169",
+    "n_chunks": 3,
+    "results": {
+      "PISCO": {
+        "answer": "The Norman invasion of Ireland occurred in 1169. (Document 1)",
+        "full_answer": "The Norman invasion of Ireland occurred in 1169.",
+        "latency": 310,
+        "context_tokens": 86,
+        "tokens_compressed": 86,
+        "clf_prob": 0.16,
+        "faithfulness": 96,
+        "tokens_saved": 282,
+        "tokens_full": 368,
+        "compression_ratio": "7.3×",
+        "matches_gold": true
+      },
+      "OSCAR": {
+        "answer": "The Normans invaded at Bannow Bay in 1169. (Information from Document 1)",
+        "full_answer": "The Normans invaded at Bannow Bay in 1169. (Information from Document 1)",
+        "latency": 390,
+        "context_tokens": 86,
+        "tokens_compressed": 86,
+        "clf_prob": 0.02,
+        "faithfulness": 98,
+        "tokens_saved": 282,
+        "tokens_full": 368,
+        "compression_ratio": "3.6×",
+        "matches_gold": true
+      },
+      "xRAG": {
+        "answer": "1169. The Norman invasion of Ireland took place in 1169, when the Norman knight Strongbow, with the support of the English king Henry II, invaded Ireland to help Dermot MacMurrough, the King of Leinster, regain his throne. The",
+        "latency": 870,
+        "context_tokens": 78,
+        "tokens_compressed": 78,
+        "clf_prob": 0.98,
+        "faithfulness": 55,
+        "tokens_saved": 171,
+        "tokens_full": 368,
+        "compression_ratio": "58×",
+        "matches_gold": true
+      }
+    }
+  },
+  "Warsaw's village": {
+    "context": "Warsaw's name in the Polish language is Warszawa, approximately /vɑːrˈʃɑːvə/ (also formerly spelled Warszewa and Warszowa), meaning 'belonging to Warsz', Warsz being a shortened form of the masculine name of Slavic origin Warcisław; see also etymology of Wrocław. Folk etymology attributes the city name to a fisherman, Wars, and his wife, Sawa. According to legend, Sawa was a mermaid living in the Vistula River with whom Wars fell in love. In actuality, Warsz was a 12th/13th-century nobleman who owned a village located at the modern-day site of Mariensztat neighbourhood. See also the Vršovci family which had escaped to Poland. The official city name in full is miasto stołeczne Warszawa (English: 'The Capital City of Warsaw'). A native or resident of Warsaw is known as a Varsovian – in Polish warszawiak (male), warszawianka (female), warszawiacy (plural).",
+    "query": "What did Warsz own?",
+    "gold": "a village",
+    "n_chunks": 2,
+    "results": {
+      "PISCO": {
+        "answer": "Warsaw, according to folklore, was said to have owned a mermaid named Sawa.",
+        "latency": 380,
+        "context_tokens": 67,
+        "tokens_compressed": 67,
+        "clf_prob": 0.63,
+        "faithfulness": 97,
+        "tokens_saved": 238,
+        "tokens_full": 305,
+        "compression_ratio": "6.8×",
+        "matches_gold": false
+      },
+      "OSCAR": {
+        "answer": "In the provided documents, there is no direct information about what Warsz owned. However, it is mentioned that Warsz was a 12th/13th-century nobleman who owned a village located at the modern-day site of the Marszewska neighborhood.",
+        "full_answer": "In the provided documents, Warsz owned a village located at the modern-day site of Mariensztat neighborhood. This information can be found in Document 1 and Document 2.",
+        "latency": 480,
+        "context_tokens": 67,
+        "tokens_compressed": 67,
+        "clf_prob": 0.46,
+        "faithfulness": 99,
+        "tokens_saved": 238,
+        "tokens_full": 305,
+        "compression_ratio": "3.4×",
+        "matches_gold": false
+      },
+      "xRAG": {
+        "answer": "Warsz owned the city of Warsaw.",
+        "latency": 390,
+        "context_tokens": 38,
+        "tokens_compressed": 38,
+        "clf_prob": 1.0,
+        "faithfulness": 40,
+        "tokens_saved": 252,
+        "tokens_full": 290,
+        "compression_ratio": "55×",
+        "matches_gold": false
+      }
+    }
+  }
+}
