@@ -2,7 +2,7 @@
 CompressRouterModule — base class for building routed context-compression models.
 
 Subclass this, implement the four required methods, and use the training
-pipeline (``compression_router.train``) to learn a routing classifier that
+pipeline (``compress_router.train``) to learn a routing classifier that
 decides at inference time whether to serve the compressed or full answer.
 
 Minimal example::
@@ -128,7 +128,7 @@ class CompressRouterModule:
     def get_cache(self, key=None):
         cache = self._stage_cache.get(self.stage)
         if cache is None:
-            return None if key is not None else {}
+            return None
         if key is not None:
             return cache.get(key)
         return cache
@@ -348,11 +348,15 @@ class CompressRouterModule:
         """Move model to GPU. Override for partial placement (e.g. xRAG)."""
         if self.model is not None:
             self.model.to("cuda")
+        if self.clf is not None:
+                self.clf.to("cuda")
 
     def unpark_gpu(self):
         """Offload model from GPU to CPU."""
         if self.model is not None:
             self.model.to("cpu")
+        if self.clf is not None:
+            self.clf.to("cpu")
 
     def count_tokens_full(self, context: str, query: str) -> int:
         """Token count for the full (uncompressed) decoder input. Override if needed."""

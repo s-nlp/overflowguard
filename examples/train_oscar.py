@@ -2,7 +2,7 @@
 
 import logging
 from transformers import AutoModel
-from compression_router import CompressRouterModule, TrainConfig, train_router, llm_judge
+from compress_router import CompressRouterModule, TrainConfig, train_router, llm_judge
 from jinja2.exceptions import TemplateError
 import torch
 import os
@@ -106,18 +106,18 @@ class OscarRouter(CompressRouterModule):
     def unpark_gpu(self):
         self.model.cpu()
 
+if __name__ == "__main__":
+    router = OscarRouter.from_pretrained("naver/oscar-mistral-7B")
+    router.park_gpu()
 
-router = OscarRouter.from_pretrained("naver/oscar-mistral-7B")
-router.park_gpu()
+    cfg = TrainConfig(
+        dataset="/data/train_squad.jsonl",
+        eval_dataset="/data/test_squad.jsonl",
+        output_dir="./oscar_router_ckpt",
+        epochs=100,
+        n_folds=5,
+        push_to_hub=True,
+        hub_repo_id="wexumin/oscar-7b-router",
+    )
 
-cfg = TrainConfig(
-    dataset="/data/train_squad.jsonl",
-    eval_dataset="/data/test_squad.jsonl",
-    output_dir="./oscar_router_ckpt",
-    epochs=100,
-    n_folds=5,
-    push_to_hub=True,
-    hub_repo_id="wexumin/oscar-7b-router",
-)
-
-result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat"))
+    result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat"))

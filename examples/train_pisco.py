@@ -1,6 +1,6 @@
 import logging
 from transformers import AutoModel
-from compression_router import CompressRouterModule, TrainConfig, train_router
+from compress_router import CompressRouterModule, TrainConfig, train_router
 from openai import OpenAI
 import os
 
@@ -45,7 +45,7 @@ class PiscoRouter(CompressRouterModule):
 
     def generate_full(self, context, query, **kw):
         dec_ids, dec_mask = self._full_inputs(context, query)
-        dev = self.model.device
+        dev = self.model.decoder.device
         inputs_embeds = self.model.decoder.get_input_embeddings()(dec_ids.to(dev))
         if "decoder_adapter" in self.model.adapter_keys:
             self.model.decoder.set_adapter("decoder_adapter")
@@ -98,28 +98,28 @@ class PiscoRouter(CompressRouterModule):
         ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         return ids["input_ids"], ids["attention_mask"]
 
+if __name__ == "__main__":
+    # load bare model (no router_config.json → just loads the model)
+    router = PiscoRouter.from_pretrained("naver/pisco-mistral")
+    router.park_gpu()
 
-# load bare model (no router_config.json → just loads the model)
-router = PiscoRouter.from_pretrained("naver/pisco-mistral")
-router.park_gpu()
-
-cfg = TrainConfig(
-    dataset="/data/train_squad.jsonl",
-    eval_dataset="/data/test_squad.jsonl", # {"context": ..., "query": ..., "gold": ...}
-    output_dir="./pisco_router_ckpt",
-    epochs=100,
-    n_folds=5,
-    push_to_hub=True,
-    hub_repo_id="wexumin/pisco-7b-router",
-)
-
-
-# result = {"threshold": 0.62, "auc": 0.87, "accuracy": 0.91, ...}
-# default — EM/F1, no API calls
-
-# LLM judge — async, concurrent, with progress bar
-from compression_router import llm_judge
+    cfg = TrainConfig(
+        dataset="/data/train_squad.jsonl",
+        eval_dataset="/data/test_squad.jsonl", # {"context": ..., "query": ..., "gold": ...}
+        output_dir="./pisco_router_ckpt",
+        epochs=100,
+        n_folds=5,
+        push_to_hub=False,
+        hub_repo_id="wexumin/pisco-7b-router",
+    )
 
 
-# custom settings
-result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat"))
+    # result = {"threshold": 0.62, "auc": 0.87, "accuracy": 0.91, ...}
+    # default — EM/F1, no API calls
+
+    # LLM judge — async, concurrent, with progress bar
+    from compress_router import llm_judge
+
+
+    # custom settings
+    result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat"))

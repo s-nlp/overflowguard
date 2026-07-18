@@ -14,8 +14,8 @@ from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
-from compression_router import CompressRouterModule, TrainConfig, train_router, llm_judge
-from compression_router.train import load_dataset_rows
+from compress_router import CompressRouterModule, TrainConfig, train_router, llm_judge
+from compress_router.train import load_dataset_rows
 
 sys.path.insert(0, "/workspace/xRAG")
 from src.model import SFR, XMistralForCausalLM
@@ -128,7 +128,7 @@ class XragRouter(CompressRouterModule):
 
         if embeddings.shape[0] > 1:
             embeddings = embeddings.mean(dim=0, keepdim=True)
-        return embeddings
+        return embeddings.unsqueeze(0)
 
     def generate_compressed(self, compressed_embs, query, **kw):
         dev = self.model.device
@@ -139,7 +139,7 @@ class XragRouter(CompressRouterModule):
             do_sample=False,
             max_new_tokens=kw.get("max_new_tokens", 128),
             pad_token_id=self.tokenizer.pad_token_id,
-            retrieval_embeds=compressed_embs[:1],
+            retrieval_embeds=compressed_embs[:1, :1],
         )
         return self.tokenizer.batch_decode(out, skip_special_tokens=True)[0]
 
@@ -178,7 +178,7 @@ class XragRouter(CompressRouterModule):
             self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                retrieval_embeds=compressed_embs.unsqueeze(0),
+                retrieval_embeds=compressed_embs,
             )
         finally:
             handle.remove()
@@ -195,34 +195,38 @@ class XragRouter(CompressRouterModule):
 
     def park_gpu(self):
         self.model.cuda()
+        if self.clf is not None:
+            self.clf.to("cuda")
 
     def unpark_gpu(self):
         self.model.to("cpu")
         self.retriever.to("cpu")
+        if self.clf is not None:
+            self.clf.to("cpu")
         torch.cuda.empty_cache()
         gc.collect()
 
+if __name__ == "__main__":
+    router = XragRouter.from_pretrained("Hannibal046/xrag-7b")
 
-router = XragRouter.from_pretrained("Hannibal046/xrag-7b")
+    cfg = TrainConfig(
+        dataset="/data/train_squad.jsonl",
+        eval_dataset="/data/test_squad.jsonl",
+        output_dir="./xrag_router_ckpt",
+        epochs=100,
+        n_folds=5,
+        push_to_hub=True,
+        hub_repo_id="wexumin/xrag-7b-router",
+    )
 
-cfg = TrainConfig(
-    dataset="/data/train_squad.jsonl",
-    eval_dataset="/data/test_squad.jsonl",
-    output_dir="./xrag_router_ckpt",
-    epochs=100,
-    n_folds=5,
-    push_to_hub=True,
-    hub_repo_id="wexumin/xrag-7b-router",
-)
+    # Phase 1: precompute SFR embeddings per stage (retriever on GPU, then off)
+    train_samples = load_dataset_rows(cfg)
+    router.precompute_embeddings(train_samples, router.TRAIN_COLLECT, cfg.output_dir)
+    if cfg.eval_dataset:
+        eval_cfg = TrainConfig(**{**cfg.__dict__, "dataset": cfg.eval_dataset, "output_dir": cfg.output_dir + "/eval"})
+        eval_samples = load_dataset_rows(eval_cfg)
+        router.precompute_embeddings(eval_samples, router.EVAL_COLLECT, eval_cfg.output_dir)
 
-# Phase 1: precompute SFR embeddings per stage (retriever on GPU, then off)
-train_samples = load_dataset_rows(cfg)
-router.precompute_embeddings(train_samples, router.TRAIN_COLLECT, cfg.output_dir)
-if cfg.eval_dataset:
-    eval_cfg = TrainConfig(**{**cfg.__dict__, "dataset": cfg.eval_dataset, "output_dir": cfg.output_dir + "/eval"})
-    eval_samples = load_dataset_rows(eval_cfg)
-    router.precompute_embeddings(eval_samples, router.EVAL_COLLECT, eval_cfg.output_dir)
-
-# Phase 2: LLM on GPU for generate + extract + CLF training
-router.park_gpu()
-result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat"))
+    # Phase 2: LLM on GPU for generate + extract + CLF training
+    router.park_gpu()
+    result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat"))
