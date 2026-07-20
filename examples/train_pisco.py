@@ -1,13 +1,13 @@
 import logging
 from transformers import AutoModel
-from compress_router import CompressRouterModule, TrainConfig, train_router
+from overflowguard import OverflowRouter, TrainConfig, train_router
 from openai import OpenAI
 import os
 
 logging.basicConfig(level=logging.INFO)
 
 
-class PiscoRouter(CompressRouterModule):
+class PiscoRouter(OverflowRouter):
 
     def _load_model(self, path, **kwargs):
         self.model = AutoModel.from_pretrained(path, trust_remote_code=True).eval()
@@ -118,7 +118,7 @@ if __name__ == "__main__":
     # default — EM/F1, no API calls
 
     # LLM judge — async, concurrent, with progress bar
-    from compress_router import llm_judge
+    from overflowguard import llm_judge
 
 
     # custom settings

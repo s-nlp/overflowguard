@@ -1,7 +1,7 @@
 """
 RouterClassifier - small MLP that decides compressed vs full.
 
-This is the default classifier shipped with compress_router. Users can
+This is the default classifier shipped with overflowguard. Users can
 substitute their own ``nn.Module`` via the training config - the only
 contract is ``forward(x) -> (batch,)`` logits.
 """

@@ -1,13 +1,13 @@
 """
-CompressRouterModule — base class for building routed context-compression models.
+OverflowRouter — base class for building routed context-compression models.
 
 Subclass this, implement the four required methods, and use the training
-pipeline (``compress_router.train``) to learn a routing classifier that
+pipeline (``overflowguard.train``) to learn a routing classifier that
 decides at inference time whether to serve the compressed or full answer.
 
 Minimal example::
 
-    class MyRouter(CompressRouterModule):
+    class MyRouter(OverflowRouter):
         def compress(self, documents, query=None):
             return self.model.compress_documents(documents)
 
@@ -54,7 +54,7 @@ _ROUTER_CONFIG = "router_config.json"
 _CLF_CHECKPOINT = "routing_clf.pt"
 
 
-class CompressRouterModule:
+class OverflowRouter:
     """Abstract base for any compress-then-route model.
 
     Provides ``self.model`` and ``self.tokenizer`` loaded automatically

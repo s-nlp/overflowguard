@@ -2,7 +2,7 @@
 
 import logging
 from transformers import AutoModel
-from compress_router import CompressRouterModule, TrainConfig, train_router, llm_judge
+from overflowguard import OverflowRouter, TrainConfig, train_router, llm_judge
 from jinja2.exceptions import TemplateError
 import torch
 import os
@@ -10,7 +10,7 @@ import os
 logging.basicConfig(level=logging.INFO)
 
 
-class OscarRouter(CompressRouterModule):
+class OscarRouter(OverflowRouter):
 
     def _load_model(self, path, **kwargs):
         self.model = AutoModel.from_pretrained(path, trust_remote_code=True).eval()

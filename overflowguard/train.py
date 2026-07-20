@@ -2,10 +2,10 @@
 Training pipeline for the routing classifier.
 
 Usage (CLI):
-    python -m compress_router.train --config router_config.yaml --model my_module:MyRouter --model_path /models/my-model
+    python -m overflowguard.train --config router_config.yaml --model my_module:MyRouter --model_path /models/my-model
 
 Usage (Python):
-    from compress_router.train import train_router
+    from overflowguard.train import train_router
     from my_module import MyRouter
 
     model = MyRouter.from_pretrained("/models/my-model")

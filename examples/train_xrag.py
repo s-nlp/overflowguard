@@ -14,8 +14,8 @@ from pathlib import Path
 
 import torch
 from transformers import AutoTokenizer
-from compress_router import CompressRouterModule, TrainConfig, train_router, llm_judge
-from compress_router.train import load_dataset_rows
+from overflowguard import OverflowRouter, TrainConfig, train_router, llm_judge
+from overflowguard.train import load_dataset_rows
 
 sys.path.insert(0, "/workspace/xRAG")
 from src.model import SFR, XMistralForCausalLM
@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 RAG_TEMPLATE = "[INST] Refer to the background document and answer the questions:\n\nBackground: {document}\n\nQuestion: {question} [/INST] The answer is:"
 
 
-class XragRouter(CompressRouterModule):
+class XragRouter(OverflowRouter):
 
     def _load_model(self, path, **kwargs):
         self.model = XMistralForCausalLM.from_pretrained(

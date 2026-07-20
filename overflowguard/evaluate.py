@@ -107,7 +107,7 @@ def llm_judge(
 
     Usage::
 
-        from compress_router.evaluate import llm_judge
+        from overflowguard.evaluate import llm_judge
         train_router(model, cfg, evaluator=llm_judge())
         # or with custom settings:
         train_router(model, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat"))
