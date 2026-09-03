@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from .classifier import RouterClassifier
+from .classifier import RouterClassifier, RouterEnsemble
 from .config import TrainConfig
 from .evaluate import default_evaluate
 
@@ -62,6 +62,48 @@ def load_dataset_rows(cfg: TrainConfig) -> list[dict]:
             if cfg.max_samples and len(rows) >= cfg.max_samples:
                 break
     return rows
+
+
+# ── Batched fan-out helpers ────────────────────────────────────────
+#
+# Each falls back to the per-sample method when the router doesn't implement
+# the batched one (or when the batch is a single sample), so routers that
+# only define the 4 required methods keep working unchanged.
+
+
+def _batch_generate_full(model, ctxs, queries, cfg):
+    if len(ctxs) > 1 and hasattr(model, "generate_full_batch"):
+        return model.generate_full_batch(ctxs, queries, max_new_tokens=cfg.max_new_tokens)
+    return [model.generate_full(c, q, max_new_tokens=cfg.max_new_tokens)
+            for c, q in zip(ctxs, queries)]
+
+
+def _batch_compress(model, chunked, queries):
+    """Returns a LIST of per-sample compressed tensors (not a stacked tensor):
+    samples have different chunk counts, so they can't share a leading dim."""
+    if len(chunked) > 1 and hasattr(model, "compress_batch"):
+        return model.compress_batch(chunked, queries=queries)
+    return [model.compress(ch, query=q) for ch, q in zip(chunked, queries)]
+
+
+def _batch_generate_compressed(model, embs, queries, cfg):
+    if len(embs) > 1 and hasattr(model, "generate_compressed_batch"):
+        return model.generate_compressed_batch(embs, queries, max_new_tokens=cfg.max_new_tokens)
+    return [model.generate_compressed(e, q, max_new_tokens=cfg.max_new_tokens)
+            for e, q in zip(embs, queries)]
+
+
+def _batch_features(model, ctxs, queries, embs):
+    if len(ctxs) > 1 and hasattr(model, "extract_clf_features_batch"):
+        import inspect
+        params = inspect.signature(model.extract_clf_features_batch).parameters
+        # routers that accept precomputed embeddings avoid compressing twice
+        if "compressed_embs" in params:
+            out = model.extract_clf_features_batch(ctxs, queries, compressed_embs=embs)
+        else:
+            out = model.extract_clf_features_batch(ctxs, queries)
+        return [out[j].cpu() for j in range(len(ctxs))]
+    return [model.extract_clf_features(e, q).cpu() for e, q in zip(embs, queries)]
 
 
 # ── Feature collection (incremental) ───────────────────────────────
@@ -129,45 +171,44 @@ def collect_features(
     task = progress.add_task("Collecting features", total=len(samples), completed=start_idx)
     progress.start()
 
+    bs = max(1, getattr(cfg, "collect_batch_size", 1))
+
     try:
-        for i in range(start_idx, len(samples)):
-            sample = samples[i]
-            ctx, query, gold = sample["context"], sample["query"], sample["gold"]
+        for start in range(start_idx, len(samples), bs):
+            batch = samples[start:start + bs]
+            ctxs = [s["context"] for s in batch]
+            queries = [s["query"] for s in batch]
+            chunked = [model._chunk_text(c) for c in ctxs]
 
-            model._current_sample_idx = i
+            model._current_sample_idx = start
 
-            full_answer = model.generate_full(ctx, query, max_new_tokens=cfg.max_new_tokens)
+            full_answers = _batch_generate_full(model, ctxs, queries, cfg)
+            embs = _batch_compress(model, chunked, queries)
+            comp_answers = _batch_generate_compressed(model, embs, queries, cfg)
+            feats = _batch_features(model, ctxs, queries, embs)
 
-            compressed_embs = model.compress(model._chunk_text(ctx), query=query)
-            comp_answer = model.generate_compressed(
-                compressed_embs, query, max_new_tokens=cfg.max_new_tokens,
-            )
-            feat = model.extract_clf_features(compressed_embs, query).cpu()
-
-            tokens_full = model.count_tokens_full(ctx, query)
-            tokens_compressed = model.count_tokens_compressed(compressed_embs, query)
-
-            features.append(feat)
-            results.append({
-                "id": i,
-                "query": query,
-                "gold": gold,
-                "context": ctx,
-                "comp_answer": comp_answer,
-                "full_answer": full_answer,
-                "comp_correct": None,
-                "full_correct": None,
-                "tokens_full": tokens_full,
-                "tokens_compressed": tokens_compressed,
-            })
+            for j, sample in enumerate(batch):
+                features.append(feats[j])
+                results.append({
+                    "id": start + j,
+                    "query": queries[j],
+                    "gold": sample["gold"],
+                    "context": ctxs[j],
+                    "comp_answer": comp_answers[j],
+                    "full_answer": full_answers[j],
+                    "comp_correct": None,
+                    "full_correct": None,
+                    "tokens_full": model.count_tokens_full(ctxs[j], queries[j]),
+                    "tokens_compressed": model.count_tokens_compressed(embs[j], queries[j]),
+                })
 
             torch.save(
                 {"features": torch.stack(features), "results": results,
-                 "first_sample": samples[0], "next_idx": i + 1},
+                 "first_sample": samples[0], "next_idx": start + len(batch)},
                 cache_path,
             )
 
-            progress.update(task, advance=1)
+            progress.update(task, advance=len(batch))
 
     finally:
         progress.stop()
@@ -291,13 +332,20 @@ def _cv_predict(
     labels: torch.Tensor,
     cfg: TrainConfig,
     n_folds: int = 5,
-) -> torch.Tensor:
-    """Train CLF on stratified k folds, return out-of-fold probabilities."""
+) -> tuple[torch.Tensor, list[RouterClassifier]]:
+    """Train CLF on stratified k folds.
+
+    Returns:
+        oof_probs: out-of-fold probabilities (one per sample, from the fold
+            that held it out — leakage-free, used for threshold search).
+        models: the K trained fold models, kept for the inference ensemble.
+    """
     from sklearn.model_selection import StratifiedKFold
 
     n = len(labels)
     oof_probs = torch.zeros(n)
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True)
+    models: list[RouterClassifier] = []
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=cfg.seed)
 
     progress = Progress(
         SpinnerColumn(),
@@ -310,7 +358,8 @@ def _cv_predict(
     progress.start()
 
     try:
-        for train_idx, val_idx in skf.split(features, labels):
+        for fold_i, (train_idx, val_idx) in enumerate(skf.split(features, labels)):
+            torch.manual_seed(cfg.seed + fold_i)  # deterministic per-fold init
             clf = train_clf(
                 features[train_idx], labels[train_idx], cfg,
                 val_features=features[val_idx], val_labels=labels[val_idx],
@@ -320,12 +369,13 @@ def _cv_predict(
             with torch.no_grad():
                 val_probs = clf.predict(features[val_idx].to(device)).cpu()
             oof_probs[val_idx] = val_probs
+            models.append(clf)
 
             progress.update(task, advance=1)
     finally:
         progress.stop()
 
-    return oof_probs
+    return oof_probs, models
 
 
 # ── Threshold policies ─────────────────────────────────────────────
@@ -398,6 +448,166 @@ THRESHOLD_POLICIES = {
 # ── Main entry point ────────────────────────────────────────────────
 
 
+@torch.no_grad()
+def collect_features_only(model, output_dir: str, labels_dir: str, split_subdir: str = "",
+                          batch_size: int = 1):
+    """Re-extract features for an ALREADY-labeled collection — no generation,
+    no judge. Reads comp_correct/full_correct from ``labels_dir`` and recomputes
+    only the (multi-layer) features via ``extract_clf_features``. Resume-safe.
+
+    This is the fast path for a layer sweep: labeling (generate both paths +
+    judge) is the expensive step and was already done by a prior training run,
+    so we reuse it and only pay for one cheap forward per sample.
+
+    If ``batch_size > 1`` and the router implements ``extract_clf_features_batch
+    (contexts, queries) -> (B, ...)``, samples are extracted in batches (one
+    padded decoder forward per batch) — much better GPU utilization. Otherwise
+    it falls back to per-sample extraction.
+    """
+    src = Path(labels_dir) / split_subdir / "collection.pt"
+    if not src.exists():
+        raise FileNotFoundError(f"labels_from set but {src} not found")
+    results = torch.load(src, map_location="cpu", weights_only=False)["results"]
+
+    out = Path(output_dir) / split_subdir
+    out.mkdir(parents=True, exist_ok=True)
+    cache_path = out / "sweep_feats.pt"
+
+    # tag the cache with the extraction mode so a stale cache from a different
+    # code path (e.g. an earlier batched run) is invalidated, not reused.
+    fingerprint = f"bs{batch_size}"
+
+    features, start_idx = [], 0
+    if cache_path.exists():
+        c = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if c.get("n") == len(results) and c.get("fingerprint") == fingerprint:
+            features = list(c["features"].unbind(0))
+            start_idx = c["next_idx"]
+            if start_idx >= len(results):
+                return c["features"], results
+            log.info("Resuming feature-only extraction from %d/%d", start_idx, len(results))
+        else:
+            log.info("Cache present but stale (mode/size mismatch) — recomputing")
+
+    batched = batch_size > 1 and hasattr(model, "extract_clf_features_batch")
+    if batch_size > 1 and not batched:
+        log.warning("collect_batch_size>1 but %s has no extract_clf_features_batch; "
+                    "falling back to per-sample", type(model).__name__)
+
+    model.eval()
+    # Re-saving the whole (growing, multi-GB) feature tensor every step is
+    # disk-bound and starves the GPU — checkpoint every ~256 samples instead.
+    save_every = max(batch_size, 256)
+    last_saved = start_idx
+
+    def _checkpoint(next_idx):
+        torch.save({"features": torch.stack(features), "next_idx": next_idx,
+                    "n": len(results), "fingerprint": fingerprint}, cache_path)
+
+    progress = Progress(SpinnerColumn(), TextColumn("[bold]{task.description}"),
+                        BarColumn(), MofNCompleteColumn(), TimeElapsedColumn())
+    task = progress.add_task(f"Re-extracting features {split_subdir}".strip(),
+                             total=len(results), completed=start_idx)
+    progress.start()
+    try:
+        i = start_idx
+        while i < len(results):
+            if batched:
+                batch = results[i:i + batch_size]
+                feats_b = model.extract_clf_features_batch(
+                    [r["context"] for r in batch], [r["query"] for r in batch])
+                features.extend(feats_b[j].cpu() for j in range(len(batch)))
+                i += len(batch)
+            else:
+                r = results[i]
+                emb = model.compress(model._chunk_text(r["context"]), query=r["query"])
+                features.append(model.extract_clf_features(emb, r["query"]).cpu())
+                i += 1
+            if i - last_saved >= save_every:
+                _checkpoint(i)
+                last_saved = i
+            progress.update(task, completed=i)
+    finally:
+        progress.stop()
+
+    stacked = torch.stack(features)
+    torch.save({"features": stacked, "next_idx": len(results), "n": len(results),
+                "fingerprint": fingerprint}, cache_path)
+    return stacked, results
+
+
+def _run_sweep(model, features, labels, results, cfg, evaluator):
+    """Per-layer sweep: reuse the exact train pipeline on each layer slice.
+
+    Expects ``features`` shaped ``(n_samples, n_layers, ...)`` — i.e. the user's
+    ``extract_clf_features`` returned an all-layers stack per sample. For each
+    layer we flatten the trailing dims to ``(n_samples, d)`` and run the same
+    standardize → CV ensemble → threshold → eval path as normal training.
+    Writes ``sweep_results.json`` and returns the ranked table.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    if features.dim() < 2:
+        raise ValueError(
+            "cfg.sweep=True but extract_clf_features returned a flat feature; "
+            "return a stacked (n_layers, ...) tensor per sample for a sweep."
+        )
+    n_samples, n_layers = features.shape[0], features.shape[1]
+    log.info("Layer sweep: %d layers × %d samples", n_layers, n_samples)
+
+    # collect eval features once (all layers), if an eval set is given
+    eval_features = eval_results = None
+    if cfg.eval_dataset:
+        with model.enter_stage(model.EVAL_COLLECT):
+            if cfg.labels_from:
+                eval_features, eval_results = collect_features_only(
+                    model, cfg.output_dir, cfg.labels_from, split_subdir="eval",
+                    batch_size=cfg.collect_batch_size)
+            else:
+                eval_cfg = TrainConfig(**{**cfg.__dict__, "dataset": cfg.eval_dataset,
+                                          "output_dir": cfg.output_dir + "/eval"})
+                eval_samples = load_dataset_rows(eval_cfg)
+                eval_features, eval_results = collect_features(model, eval_samples, eval_cfg, evaluator=evaluator)
+
+    policy_fn = cfg.threshold_policy
+    if isinstance(policy_fn, str):
+        policy_fn = THRESHOLD_POLICIES[policy_fn]
+
+    rows = []
+    for L in range(n_layers):
+        Xtr = features[:, L].reshape(n_samples, -1)
+        mu, sd = Xtr.mean(dim=0), Xtr.std(dim=0) + 1e-6
+        oof, models = _cv_predict((Xtr - mu) / sd, labels, cfg, n_folds=cfg.n_folds)
+        cv_auc = float(roc_auc_score(labels.numpy(), oof.numpy()))
+        threshold, th_stats = policy_fn(oof, results, steps=cfg.threshold_steps)
+
+        row = {"layer": L, "cv_auc": round(cv_auc, 4), "threshold": round(threshold, 4)}
+        if eval_features is not None:
+            ens = RouterEnsemble(models, mu, sd).eval()
+            device = next(ens.parameters()).device
+            ens.to(device)
+            Xev = eval_features[:, L].reshape(eval_features.shape[0], -1)
+            with torch.no_grad():
+                ev_prob = ens.predict(Xev.to(device)).cpu()
+            ev_stats = eval_at_threshold(ev_prob, eval_results, threshold)
+            row["eval_auc"] = ev_stats["auc"]
+            row["eval_accuracy"] = ev_stats["accuracy"]
+            row["eval_token_savings"] = ev_stats["token_savings"]
+        rows.append(row)
+        log.info("  layer %2d: cv_auc=%.4f%s", L, cv_auc,
+                 f"  eval_auc={row['eval_auc']:.4f}" if "eval_auc" in row else "")
+
+    key = "eval_auc" if eval_features is not None else "cv_auc"
+    ranked = sorted(rows, key=lambda r: r[key], reverse=True)
+    out = Path(cfg.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "sweep_results.json").write_text(json.dumps(rows, indent=2))
+    best = ranked[0]
+    log.info("Best layer: %d (%s=%.4f). Results → %s",
+             best["layer"], key, best[key], out / "sweep_results.json")
+    return {"sweep": rows, "best_layer": best["layer"], "ranked_by": key}
+
+
 def train_router(model, cfg: TrainConfig, evaluator: callable = None):
     """End-to-end: collect features → evaluate → CV threshold → train CLF → save.
 
@@ -411,7 +621,12 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
     log.info("Loaded %d train samples", len(samples))
 
     with model.enter_stage(model.TRAIN_COLLECT):
-        features, results = collect_features(model, samples, cfg, evaluator=evaluator)
+        if cfg.sweep and cfg.labels_from:
+            log.info("Sweep: reusing labels from %s (feature-only extraction)", cfg.labels_from)
+            features, results = collect_features_only(
+                model, cfg.output_dir, cfg.labels_from, batch_size=cfg.collect_batch_size)
+        else:
+            features, results = collect_features(model, samples, cfg, evaluator=evaluator)
 
     labels = torch.tensor([0.0 if r["comp_correct"] else 1.0 for r in results])
     n_overflow = int(labels.sum())
@@ -420,10 +635,20 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
         len(results), n_overflow, 100 * n_overflow / max(len(results), 1),
     )
 
-    # ── CV threshold search on train ──
+    # ── layer sweep: iterate the layer dim, report per-layer AUC ──
+    if cfg.sweep:
+        return _run_sweep(model, features, labels, results, cfg, evaluator)
+
+    # standardize features (mu/sd from full train set) — baked into the
+    # ensemble so inference passes raw features unchanged.
+    mu = features.mean(dim=0)
+    sd = features.std(dim=0) + 1e-6
+    features_std = (features - mu) / sd
+
+    # ── CV: train K fold models, collect oof probs + keep the models ──
     with model.enter_stage(model.TRAIN_THRESHOLD_SEARCH):
-        log.info("Running %d-fold CV for threshold search...", cfg.n_folds)
-        oof_probs = _cv_predict(features, labels, cfg, n_folds=cfg.n_folds)
+        log.info("Running %d-fold CV (kept as ensemble)...", cfg.n_folds)
+        oof_probs, fold_models = _cv_predict(features_std, labels, cfg, n_folds=cfg.n_folds)
 
         policy_fn = cfg.threshold_policy
         if isinstance(policy_fn, str):
@@ -431,10 +656,11 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
         threshold, th_stats = policy_fn(oof_probs, results, steps=cfg.threshold_steps)
         log.info("Optimal threshold (CV): %.3f — %s", threshold, th_stats)
 
-    # ── train final CLF on all train data ──
+    # ── assemble the ensemble (no retrain on all data) ──
     with model.enter_stage(model.TRAIN_CLF):
-        log.info("Training final classifier on all train data...")
-        clf = train_clf(features, labels, cfg)
+        log.info("Assembling %d-model ensemble...", len(fold_models))
+        clf = RouterEnsemble(fold_models, mu, sd)
+        clf.eval()
 
     # ── eval on held-out set ──
     eval_stats = None
@@ -449,6 +675,7 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
 
         with model.enter_stage(model.EVAL_CLF):
             device = next(clf.parameters()).device
+            clf.to(device)  # ensure fold models + mu/sd buffers colocated
             with torch.no_grad():
                 eval_probs = clf.predict(eval_features.to(device)).cpu()
 

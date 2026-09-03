@@ -48,7 +48,7 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download, HfApi
 from transformers import AutoModel, AutoTokenizer
 
-from .classifier import RouterClassifier
+from .classifier import RouterClassifier, RouterEnsemble
 
 _ROUTER_CONFIG = "router_config.json"
 _CLF_CHECKPOINT = "routing_clf.pt"
@@ -197,11 +197,21 @@ class OverflowRouter:
             clf_path = os.path.join(path, _CLF_CHECKPOINT)
 
         ckpt = torch.load(clf_path, map_location="cpu", weights_only=False)
-        self.clf = RouterClassifier(
-            d_input=ckpt["d_input"],
-            hidden=ckpt.get("hidden", 512),
-        )
-        self.clf.load_state_dict(ckpt["state_dict"])
+        if "n_models" in ckpt:
+            # K-fold ensemble: one skeleton, one load_state_dict (weights + mu/sd)
+            self.clf = RouterEnsemble.empty(
+                n_models=ckpt["n_models"],
+                d_input=ckpt["d_input"],
+                hidden=ckpt.get("hidden", 512),
+            )
+            self.clf.load_state_dict(ckpt["state_dict"])
+        else:
+            # legacy single classifier
+            self.clf = RouterClassifier(
+                d_input=ckpt["d_input"],
+                hidden=ckpt.get("hidden", 512),
+            )
+            self.clf.load_state_dict(ckpt["state_dict"])
         self.clf.eval()
         self.routing_threshold = config.get("threshold", ckpt.get("threshold", 0.5))
 
@@ -229,16 +239,23 @@ class OverflowRouter:
             json.dumps(config, indent=2)
         )
 
-        # save CLF
-        torch.save(
-            {
+        # save CLF (ensemble → per-fold state_dicts + standardization buffers)
+        if isinstance(self.clf, RouterEnsemble):
+            ckpt = {
+                "d_input": self.clf.d_input,
+                "hidden": self.clf.hidden,
+                "n_models": len(self.clf.models),
+                "state_dict": self.clf.state_dict(),  # models + mu/sd, one dict
+                "threshold": self.routing_threshold,
+            }
+        else:
+            ckpt = {
                 "d_input": self.clf.d_input,
                 "hidden": self.clf.hidden,
                 "state_dict": self.clf.state_dict(),
                 "threshold": self.routing_threshold,
-            },
-            os.path.join(output_dir, _CLF_CHECKPOINT),
-        )
+            }
+        torch.save(ckpt, os.path.join(output_dir, _CLF_CHECKPOINT))
 
     def push_to_hub(self, repo_id: str, output_dir: str | None = None):
         """Push router to HF Hub.

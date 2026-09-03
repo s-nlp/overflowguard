@@ -35,6 +35,9 @@ class TrainConfig:
     patience: int = 12
     warmup_epochs: int = 5
 
+    # reproducibility
+    seed: int = 42
+
     # cross-validation + threshold
     n_folds: int = 5
     threshold_steps: int = 100
@@ -42,6 +45,20 @@ class TrainConfig:
 
     # evaluation
     skip_full_wrong: bool = True
+
+    # layer sweep — when True, extract_clf_features must return a stacked
+    # (n_layers, ...) feature per sample; training iterates the layer dim and
+    # reports per-layer AUC instead of fitting one router.
+    sweep: bool = False
+    # dir of a PRIOR run's collection.pt to reuse labels from (skips the
+    # expensive generate + judge; only re-extracts features). Sweep-only.
+    labels_from: str | None = None
+    # batch size for feature collection (both normal training and the sweep's
+    # feature-only re-extraction). >1 uses the router's *_batch methods where
+    # it implements them (generate_full_batch, compress_batch,
+    # generate_compressed_batch, extract_clf_features_batch), falling back to
+    # per-sample for any it doesn't.
+    collect_batch_size: int = 1
 
     # output
     output_dir: str = "./router_checkpoint"
