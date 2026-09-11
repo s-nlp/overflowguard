@@ -78,12 +78,14 @@ def _batch_generate_full(model, ctxs, queries, cfg):
             for c, q in zip(ctxs, queries)]
 
 
-def _batch_compress(model, chunked, queries):
-    """Returns a LIST of per-sample compressed tensors (not a stacked tensor):
-    samples have different chunk counts, so they can't share a leading dim."""
-    if len(chunked) > 1 and hasattr(model, "compress_batch"):
-        return model.compress_batch(chunked, queries=queries)
-    return [model.compress(ch, query=q) for ch, q in zip(chunked, queries)]
+def _batch_compress(model, docs, queries):
+    """``docs`` is one list of documents per sample (chunks of a context, or a
+    few retrieved docs — model-dependent). Returns a LIST of per-sample
+    compressed tensors, not a stacked one: samples can contribute different
+    numbers of documents, so they share no leading dim."""
+    if len(docs) > 1 and hasattr(model, "compress_batch"):
+        return model.compress_batch(docs, queries=queries)
+    return [model.compress(d, query=q) for d, q in zip(docs, queries)]
 
 
 def _batch_generate_compressed(model, embs, queries, cfg):
@@ -178,12 +180,12 @@ def collect_features(
             batch = samples[start:start + bs]
             ctxs = [s["context"] for s in batch]
             queries = [s["query"] for s in batch]
-            chunked = [model._chunk_text(c) for c in ctxs]
+            docs = [model._chunk_text(c) for c in ctxs]
 
             model._current_sample_idx = start
 
             full_answers = _batch_generate_full(model, ctxs, queries, cfg)
-            embs = _batch_compress(model, chunked, queries)
+            embs = _batch_compress(model, docs, queries)
             comp_answers = _batch_generate_compressed(model, embs, queries, cfg)
             feats = _batch_features(model, ctxs, queries, embs)
 
@@ -416,19 +418,30 @@ def threshold_youden(probs, results, **kwargs):
 
 
 def eval_at_threshold(probs, results, threshold):
-    """Compute metrics at a fixed threshold (for held-out eval)."""
+    """Compute metrics at a fixed threshold (for held-out eval).
+
+    Pipeline accuracy credits a full-routed sample with ``full_correct``, not
+    with 1. On a filtered split (every full answer correct) the two are the
+    same; on an unfiltered split, assuming full is always right would inflate
+    accuracy by the size of the both-wrong cell.
+
+    Reported alongside are the three reference points the router sits between:
+    always-compressed, always-full, and the oracle (pick the better path per
+    sample). On an unfiltered split the oracle is below 1.0.
+    """
     import numpy as np
     from sklearn.metrics import roc_auc_score
 
     probs_np = np.array(probs)
     labels = np.array([0.0 if r["comp_correct"] else 1.0 for r in results])
     comp_correct = np.array([r["comp_correct"] for r in results], dtype=float)
+    full_correct = np.array([r["full_correct"] for r in results], dtype=float)
     full_toks = np.array([r.get("tokens_full", 1) for r in results], dtype=float)
     comp_toks = np.array([r.get("tokens_compressed", 1) for r in results], dtype=float)
 
     auc = roc_auc_score(labels, probs_np)
     use_comp = probs_np <= threshold
-    correct = np.where(use_comp, comp_correct, 1)
+    correct = np.where(use_comp, comp_correct, full_correct)
 
     return {
         "auc": round(auc, 4),
@@ -437,6 +450,13 @@ def eval_at_threshold(probs, results, threshold):
         "pct_compressed": round(float(use_comp.mean()), 4),
         "n_compressed": int(use_comp.sum()),
         "n_full": int((~use_comp).sum()),
+        # reference points, same split
+        "acc_always_compressed": round(float(comp_correct.mean()), 4),
+        "acc_always_full": round(float(full_correct.mean()), 4),
+        "acc_oracle": round(float(np.maximum(comp_correct, full_correct).mean()), 4),
+        # the cell that filtered training never penalizes: comp right, full wrong
+        "n_comp_right_full_wrong": int(((comp_correct == 1) & (full_correct == 0)).sum()),
+        "n_both_wrong": int(((comp_correct == 0) & (full_correct == 0)).sum()),
     }
 
 
@@ -446,94 +466,6 @@ THRESHOLD_POLICIES = {
 
 
 # ── Main entry point ────────────────────────────────────────────────
-
-
-@torch.no_grad()
-def collect_features_only(model, output_dir: str, labels_dir: str, split_subdir: str = "",
-                          batch_size: int = 1):
-    """Re-extract features for an ALREADY-labeled collection — no generation,
-    no judge. Reads comp_correct/full_correct from ``labels_dir`` and recomputes
-    only the (multi-layer) features via ``extract_clf_features``. Resume-safe.
-
-    This is the fast path for a layer sweep: labeling (generate both paths +
-    judge) is the expensive step and was already done by a prior training run,
-    so we reuse it and only pay for one cheap forward per sample.
-
-    If ``batch_size > 1`` and the router implements ``extract_clf_features_batch
-    (contexts, queries) -> (B, ...)``, samples are extracted in batches (one
-    padded decoder forward per batch) — much better GPU utilization. Otherwise
-    it falls back to per-sample extraction.
-    """
-    src = Path(labels_dir) / split_subdir / "collection.pt"
-    if not src.exists():
-        raise FileNotFoundError(f"labels_from set but {src} not found")
-    results = torch.load(src, map_location="cpu", weights_only=False)["results"]
-
-    out = Path(output_dir) / split_subdir
-    out.mkdir(parents=True, exist_ok=True)
-    cache_path = out / "sweep_feats.pt"
-
-    # tag the cache with the extraction mode so a stale cache from a different
-    # code path (e.g. an earlier batched run) is invalidated, not reused.
-    fingerprint = f"bs{batch_size}"
-
-    features, start_idx = [], 0
-    if cache_path.exists():
-        c = torch.load(cache_path, map_location="cpu", weights_only=False)
-        if c.get("n") == len(results) and c.get("fingerprint") == fingerprint:
-            features = list(c["features"].unbind(0))
-            start_idx = c["next_idx"]
-            if start_idx >= len(results):
-                return c["features"], results
-            log.info("Resuming feature-only extraction from %d/%d", start_idx, len(results))
-        else:
-            log.info("Cache present but stale (mode/size mismatch) — recomputing")
-
-    batched = batch_size > 1 and hasattr(model, "extract_clf_features_batch")
-    if batch_size > 1 and not batched:
-        log.warning("collect_batch_size>1 but %s has no extract_clf_features_batch; "
-                    "falling back to per-sample", type(model).__name__)
-
-    model.eval()
-    # Re-saving the whole (growing, multi-GB) feature tensor every step is
-    # disk-bound and starves the GPU — checkpoint every ~256 samples instead.
-    save_every = max(batch_size, 256)
-    last_saved = start_idx
-
-    def _checkpoint(next_idx):
-        torch.save({"features": torch.stack(features), "next_idx": next_idx,
-                    "n": len(results), "fingerprint": fingerprint}, cache_path)
-
-    progress = Progress(SpinnerColumn(), TextColumn("[bold]{task.description}"),
-                        BarColumn(), MofNCompleteColumn(), TimeElapsedColumn())
-    task = progress.add_task(f"Re-extracting features {split_subdir}".strip(),
-                             total=len(results), completed=start_idx)
-    progress.start()
-    try:
-        i = start_idx
-        while i < len(results):
-            if batched:
-                batch = results[i:i + batch_size]
-                feats_b = model.extract_clf_features_batch(
-                    [r["context"] for r in batch], [r["query"] for r in batch])
-                features.extend(feats_b[j].cpu() for j in range(len(batch)))
-                i += len(batch)
-            else:
-                r = results[i]
-                emb = model.compress(model._chunk_text(r["context"]), query=r["query"])
-                features.append(model.extract_clf_features(emb, r["query"]).cpu())
-                i += 1
-            if i - last_saved >= save_every:
-                _checkpoint(i)
-                last_saved = i
-            progress.update(task, completed=i)
-    finally:
-        progress.stop()
-
-    stacked = torch.stack(features)
-    torch.save({"features": stacked, "next_idx": len(results), "n": len(results),
-                "fingerprint": fingerprint}, cache_path)
-    return stacked, results
 
 
 def _run_sweep(model, features, labels, results, cfg, evaluator):
@@ -559,15 +491,11 @@ def _run_sweep(model, features, labels, results, cfg, evaluator):
     eval_features = eval_results = None
     if cfg.eval_dataset:
         with model.enter_stage(model.EVAL_COLLECT):
-            if cfg.labels_from:
-                eval_features, eval_results = collect_features_only(
-                    model, cfg.output_dir, cfg.labels_from, split_subdir="eval",
-                    batch_size=cfg.collect_batch_size)
-            else:
-                eval_cfg = TrainConfig(**{**cfg.__dict__, "dataset": cfg.eval_dataset,
-                                          "output_dir": cfg.output_dir + "/eval"})
-                eval_samples = load_dataset_rows(eval_cfg)
-                eval_features, eval_results = collect_features(model, eval_samples, eval_cfg, evaluator=evaluator)
+            eval_cfg = TrainConfig(**{**cfg.__dict__, "dataset": cfg.eval_dataset,
+                                      "output_dir": cfg.output_dir + "/eval",
+                                      "skip_full_wrong": False})
+            eval_samples = load_dataset_rows(eval_cfg)
+            eval_features, eval_results = collect_features(model, eval_samples, eval_cfg, evaluator=evaluator)
 
     policy_fn = cfg.threshold_policy
     if isinstance(policy_fn, str):
@@ -621,12 +549,7 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
     log.info("Loaded %d train samples", len(samples))
 
     with model.enter_stage(model.TRAIN_COLLECT):
-        if cfg.sweep and cfg.labels_from:
-            log.info("Sweep: reusing labels from %s (feature-only extraction)", cfg.labels_from)
-            features, results = collect_features_only(
-                model, cfg.output_dir, cfg.labels_from, batch_size=cfg.collect_batch_size)
-        else:
-            features, results = collect_features(model, samples, cfg, evaluator=evaluator)
+        features, results = collect_features(model, samples, cfg, evaluator=evaluator)
 
     labels = torch.tensor([0.0 if r["comp_correct"] else 1.0 for r in results])
     n_overflow = int(labels.sum())
@@ -666,12 +589,17 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
     eval_stats = None
     if cfg.eval_dataset:
         log.info("Loading eval dataset from %s", cfg.eval_dataset)
-        eval_cfg = TrainConfig(**{**cfg.__dict__, "dataset": cfg.eval_dataset, "output_dir": cfg.output_dir + "/eval"})
+        # Training stays filtered (routing can only repair comp-wrong/full-right),
+        # but the eval split keeps every sample so pipeline metrics are honest.
+        eval_cfg = TrainConfig(**{**cfg.__dict__, "dataset": cfg.eval_dataset,
+                                  "output_dir": cfg.output_dir + "/eval",
+                                  "skip_full_wrong": False})
         eval_samples = load_dataset_rows(eval_cfg)
         log.info("Loaded %d eval samples", len(eval_samples))
 
         with model.enter_stage(model.EVAL_COLLECT):
-            eval_features, eval_results = collect_features(model, eval_samples, eval_cfg, evaluator=evaluator)
+            eval_features, eval_results = collect_features(
+                model, eval_samples, eval_cfg, evaluator=evaluator)
 
         with model.enter_stage(model.EVAL_CLF):
             device = next(clf.parameters()).device
