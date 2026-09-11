@@ -154,11 +154,15 @@ def collect_features(
             start_idx = cached.get("next_idx", len(results))
             if start_idx >= len(samples):
                 log.info("Collection complete (%d samples), using cache", len(results))
-                # re-evaluate if not yet scored
-                if results and results[0].get("comp_correct") is None:
-                    log.info("Scoring cached results...")
-                    evaluator(results)
-                return cached["features"], results
+                if not _has_unscored(results):
+                    return cached["features"], results
+                # generation done but verdicts missing (e.g. judge interrupted,
+                # or labels reset): score, filter and SAVE via the same tail as
+                # a fresh run, so the verdicts are paid for once.
+                log.info("Scoring %d unscored cached results...",
+                         sum(1 for r in results if _is_unscored(r)))
+                return _score_filter_save(model, features, results, cfg, evaluator,
+                                          samples, cache_path)
             log.info("Resuming collection from sample %d/%d", start_idx, len(samples))
 
     model.eval()
@@ -215,11 +219,31 @@ def collect_features(
     finally:
         progress.stop()
 
-    # score all results
+    return _score_filter_save(model, features, results, cfg, evaluator, samples, cache_path)
+
+
+def _is_unscored(r) -> bool:
+    return r.get("comp_correct") is None or r.get("full_correct") is None
+
+
+def _has_unscored(results) -> bool:
+    # every row, not just results[0]: a partially-judged collection is exactly
+    # the case that needs catching
+    return any(_is_unscored(r) for r in results)
+
+
+def _score_filter_save(model, features, results, cfg, evaluator, samples, cache_path):
+    """Score → filter → save. Shared by a fresh collection and by a cached one
+    whose verdicts are missing, so both end in the same on-disk state."""
     _eval_stages = {model.TRAIN_COLLECT: model.TRAIN_EVALUATE, model.EVAL_COLLECT: model.EVAL_EVALUATE}
     with model.enter_stage(_eval_stages.get(model.stage, model.stage)):
         log.info("Evaluating %d samples...", len(results))
-        evaluator(results)
+        evaluator(results)  # judges only rows still unscored
+
+    if _has_unscored(results):
+        raise RuntimeError(
+            f"{sum(1 for r in results if _is_unscored(r))} samples still unscored after "
+            f"the evaluator ran — refusing to train on partial labels")
 
     # filter out samples where full answer is wrong
     if cfg.skip_full_wrong:
