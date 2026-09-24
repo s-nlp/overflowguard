@@ -1,6 +1,16 @@
+# Both palettes ship to the browser; each viewer picks one in ⋮ → Settings
+# (default: their OS setting). The app's own --t-* CSS variables follow
+# whichever one is showing — see the theme script in app.py.
 [theme]
 primaryColor = "#EF7849"
+font = "monospace"
+
+[theme.light]
+backgroundColor = "#F8F9FA"
+secondaryBackgroundColor = "#F1F3F5"
+textColor = "#212529"
+
+[theme.dark]
 backgroundColor = "#0A0C0F"
 secondaryBackgroundColor = "#12151A"
 textColor = "#E7E9EC"
-font = "monospace"
