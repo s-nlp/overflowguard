@@ -4,9 +4,9 @@ This folder contains uncertainty-estimation baselines for OverflowGuard.
 
 The intended comparison is:
 
-## Post-generation baselines
+## Pre-generation baselines
 
-Computed from the **compressed-path answer**:
+Computed from input tokens after the **compressed context**:
 
 - Perplexity
 - Focus
