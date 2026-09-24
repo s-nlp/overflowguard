@@ -44,19 +44,22 @@ class PiscoSweepRouter(PiscoRouter):
 
 
 if __name__ == "__main__":
-    router = PiscoSweepRouter.from_pretrained("naver/pisco-mistral")
+    router = PiscoSweepRouter.from_pretrained("naver/pisco-llama")
     router.park_gpu()
 
     cfg = TrainConfig(
         dataset="./squad/train.jsonl",
         eval_dataset="./squad/test.jsonl",
-        output_dir="./pisco_router_sweep",
+        output_dir="./pisco_llama_router_sweep",
         sweep=True,
-        collect_batch_size=32,               # batch the decoder forward
+        collect_batch_size=32,
+        skip_full_wrong=False, # batch the decoder forward
         epochs=60,
+        
         n_folds=5,
     )
     from overflowguard import llm_judge
 
-    result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat",  api_key="sk-b7c60a07a2a64dc6a1396eebea6d4e22"))  # evaluator unused in reuse mode
-    print("best layer:", result["best_layer"])
+    result = train_router(router, cfg)
+    # result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat",  api_key="sk-b7c60a07a2a64dc6a1396eebea6d4e22"))  # evaluator unused in reuse mode
+    # print("best layer:", result["best_layer"])

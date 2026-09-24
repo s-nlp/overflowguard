@@ -13,7 +13,8 @@ class PiscoRouter(OverflowRouter):
     MID_LAYER = 17
 
     def _load_model(self, path, **kwargs):
-        self.model = AutoModel.from_pretrained(path, trust_remote_code=True).eval()
+        self.model = AutoModel.from_pretrained(path, trust_remote_code=True, **kwargs).eval()
+        self.model.set_attn_implementation('eager')
         self.tokenizer = self.model.decoder_tokenizer
         self._attach_mid_hook()
         self._judge_client = None
@@ -236,6 +237,7 @@ if __name__ == "__main__":
         n_folds=5,
         collect_batch_size=32,
         push_to_hub=False,
+        skip_full_wrong=False,
         hub_repo_id="wexumin/pisco-7b-router",
     )
 
@@ -248,4 +250,5 @@ if __name__ == "__main__":
 
 
     # custom settings
-    result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat"))
+    result = train_router(router, cfg)
+    # result = train_router(router, cfg, evaluator=llm_judge(concurrency=30, model="deepseek-chat"))

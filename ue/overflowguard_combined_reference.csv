@@ -1,0 +1,9 @@
+compressor,model,auc,acc_c,acc_r,delta_acc,r_c,s_tok
+xRAG,mistral-7b,80.7,53.7,80.1,26.4,54.9,53.4
+xRAG,mixtral-8x7b,82.9,60.7,85.4,24.6,51.5,50.5
+OSCAR,mistral-7b,76.9,76.2,81.9,5.7,71.8,64.3
+OSCAR,mistral-24b,86.1,78.6,84.6,6.0,68.3,61.7
+OSCAR,qwen-7b,83.5,73.4,81.6,8.2,63.3,56.9
+PISCO,mistral-7b,74.1,74.2,83.1,8.9,62.8,55.6
+PISCO,solar-7b,72.0,78.0,85.3,7.4,56.3,49.3
+PISCO,llama-8b,76.1,76.7,85.1,8.4,54.0,47.6
