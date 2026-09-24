@@ -60,12 +60,22 @@ def em_or_f1(prediction: str, gold: str | list[str], f1_threshold: float = 0.5) 
 
 
 def default_evaluate(results: list[dict]) -> None:
-    """Score all results in-place using EM-or-F1."""
+    """Score all results in-place using EM-or-F1 against any valid gold answer."""
     for r in results:
+        golds = r["gold"] if isinstance(r["gold"], list) else [r["gold"]]
+        golds = [str(g) for g in golds]
+
         if r.get("full_correct") is None:
-            r["full_correct"] = em_or_f1(r["full_answer"], r["gold"])
+            r["full_correct"] = any(
+                em_or_f1(str(r["full_answer"]), gold)
+                for gold in golds
+            )
+
         if r.get("comp_correct") is None:
-            r["comp_correct"] = em_or_f1(r["comp_answer"], r["gold"])
+            r["comp_correct"] = any(
+                em_or_f1(str(r["comp_answer"]), gold)
+                for gold in golds
+            )
 
 
 # ── LLM Judge ──────────────────────────────────────────────────────
