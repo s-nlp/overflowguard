@@ -8,6 +8,9 @@ Pipeline order (matches real model):
   4. generate with chosen path
 """
 
+import functools
+import hashlib
+import logging
 import queue
 import random
 import re
@@ -15,6 +18,9 @@ import time
 from collections import Counter
 
 import torch
+import torch.nn.functional as F
+
+log = logging.getLogger(__name__)
 
 FIRST_TOKEN_DELAY = {"PISCO": 0.08, "OSCAR": 0.045, "xRAG": 0.025}
 DECODE_STEP = 0.019
@@ -23,6 +29,17 @@ CHUNK_SIZE = 128
 
 def _tokenize(text):
     return text.split()
+
+
+def _stable_clf_prob(text, query, model_name=""):
+    """Deterministic pseudo-CLF for free-form inputs (no saved preset).
+
+    A real router classifier is deterministic — same input, same probability —
+    so we hash the (query, context, model) instead of drawing a fresh random
+    value each rerun (which made the CLF badge flicker). Range [0.05, 0.95]."""
+    key = f"{model_name}␟{query}␟{text}".encode("utf-8")
+    h = int(hashlib.md5(key).hexdigest()[:8], 16)
+    return round(0.05 + (h % 9001) / 10000, 4)
 
 
 def _sent_split(text):
@@ -53,6 +70,50 @@ def _best_sentences(context, query, max_sents=2):
     return " ".join(s for _, s in scored[:max_sents])
 
 
+# Small sentence-embedding model (~90 MB, CPU-friendly) for the free-form answer.
+_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+@functools.lru_cache(maxsize=1)
+def _sentence_encoder():
+    """(tokenizer, model), loaded once per process; None if unavailable (e.g. offline)."""
+    try:
+        from transformers import AutoModel, AutoTokenizer
+
+        return (
+            AutoTokenizer.from_pretrained(_EMBED_MODEL),
+            AutoModel.from_pretrained(_EMBED_MODEL).eval(),
+        )
+    except Exception as e:  # any load failure → lexical fallback, never a crash
+        log.warning("Sentence encoder %s unavailable (%s); using word overlap", _EMBED_MODEL, e)
+        return None
+
+
+@torch.no_grad()
+def _embed(texts, tok, model, batch_size=64):
+    """Mean-pooled, L2-normalized sentence embeddings, shape (len(texts), d)."""
+    out = []
+    for i in range(0, len(texts), batch_size):
+        enc = tok(texts[i : i + batch_size], padding=True, truncation=True,
+                  max_length=256, return_tensors="pt")
+        hidden = model(**enc).last_hidden_state
+        mask = enc["attention_mask"].unsqueeze(-1).float()
+        out.append((hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9))
+    return F.normalize(torch.cat(out), dim=-1)
+
+
+def _closest_sentence(context, query):
+    """The context sentence semantically closest to the query (cosine similarity)."""
+    sents = _sent_split(context)
+    if not sents:
+        return context[:200]
+    encoder = _sentence_encoder()
+    if encoder is None:
+        return _best_sentences(context, query, max_sents=1)
+    embs = _embed([query] + sents, *encoder)
+    return sents[int((embs[1:] @ embs[0]).argmax())]
+
+
 class MockModel:
     """Drop-in mock for COCOMRouter.
 
@@ -64,7 +125,8 @@ class MockModel:
             ...
     """
 
-    DEFAULT_THRESHOLD = {"xRAG": 0.431, "PISCO": 0.25, "OSCAR": 0.14}
+    # Operating thresholds from new_presets.jsonl (so the default route matches).
+    DEFAULT_THRESHOLD = {"xRAG": 0.5566, "PISCO": 0.1992, "OSCAR": 0.1325}
 
     def __init__(self, model_name="PISCO", num_mem_tokens=None, d_model=4096):
         self.model_name = model_name
@@ -76,6 +138,14 @@ class MockModel:
         self.routing_threshold = self.DEFAULT_THRESHOLD[model_name]
 
     def to(self, *args, **kwargs):
+        return self
+
+    # No-op GPU hooks so _ensure_gpu can call these unconditionally (the mock
+    # has no real weights to move).
+    def park_gpu(self):
+        return self
+
+    def unpark_gpu(self):
         return self
 
     def compress(self, input_ids, attention_mask):
@@ -117,11 +187,12 @@ class MockModel:
         yield {
             "stage": "compression",
             "compressed_embs": compressed_embs,
+            "tokens_full": tokens_full,  # context tokens (no prompt), for the bars
             "exec_time": time.perf_counter() - t0,
         }
 
         t0 = time.perf_counter()
-        clf_prob = preset["clf_prob"] if preset else 0.7 + random.random() * 0.25
+        clf_prob = preset["clf_prob"] if preset else _stable_clf_prob(text, query, self.model_name)
         if mode == "auto":
             chosen = "compressed" if clf_prob <= threshold else "full"
         else:
@@ -142,7 +213,7 @@ class MockModel:
             prediction = prediction or preset.get("answer", "")
         else:
             q = query if query else text[:100]
-            prediction = _best_sentences(text, q)
+            prediction = _closest_sentence(text, q)
 
         answer_words = prediction.split()
         t0 = time.perf_counter()
@@ -152,11 +223,8 @@ class MockModel:
             if i < len(answer_words) - 1:
                 time.sleep(DECODE_STEP)
 
-        if preset:
-            tokens_full = preset["tokens_full"]
-            tokens_compressed = preset["tokens_compressed"]
-        else:
-            tokens_compressed = compressed_embs.shape[0] * compressed_embs.shape[1]
+        # Context-only counts (no prompt): full = context tokens, compressed = mem tokens.
+        tokens_compressed = compressed_embs.shape[0] * compressed_embs.shape[1]
         tokens_saved = (
             max(0, tokens_full - tokens_compressed) if chosen == "compressed" else 0
         )

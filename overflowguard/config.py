@@ -44,18 +44,17 @@ class TrainConfig:
     threshold_policy: str = "youden"  # "youden" (default), or pass a callable
 
     # evaluation
-    skip_full_wrong: bool = True
+    # With the strict overflow label (comp wrong AND full right), full-wrong
+    # rows are valid negatives. True excludes them from TRAINING for this run
+    # only (in memory); the saved collection always keeps every row.
+    skip_full_wrong: bool = False
 
     # layer sweep — when True, extract_clf_features must return a stacked
     # (n_layers, ...) feature per sample; training iterates the layer dim and
     # reports per-layer AUC instead of fitting one router.
     sweep: bool = False
-    # dir of a PRIOR run's collection.pt to reuse labels from (skips the
-    # expensive generate + judge; only re-extracts features). Sweep-only.
-    labels_from: str | None = None
-    # batch size for feature collection (both normal training and the sweep's
-    # feature-only re-extraction). >1 uses the router's *_batch methods where
-    # it implements them (generate_full_batch, compress_batch,
+    # batch size for feature collection. >1 uses the router's *_batch methods
+    # where it implements them (generate_full_batch, compress_batch,
     # generate_compressed_batch, extract_clf_features_batch), falling back to
     # per-sample for any it doesn't.
     collect_batch_size: int = 1

@@ -23,13 +23,19 @@ Flow:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
+from rich.progress import (
+    BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn,
+)
 from torch.utils.data import DataLoader, TensorDataset
 
 from .classifier import RouterClassifier, RouterEnsemble
@@ -37,9 +43,6 @@ from .config import TrainConfig
 from .evaluate import default_evaluate
 
 log = logging.getLogger(__name__)
-
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
-
 
 
 # ── Data loading ────────────────────────────────────────────────────
@@ -111,12 +114,104 @@ def _batch_features(model, ctxs, queries, embs):
 # ── Feature collection (incremental) ───────────────────────────────
 
 
+def _process_batch(model, batch, ids, cfg):
+    """Generate both answers + features for the samples at dataset positions `ids`.
+
+    `ids` need not be consecutive. They are exposed to the router as
+    ``model._current_sample_ids`` so routers that read a precomputed per-sample
+    cache (xRAG's SFR embeddings) look up the right rows for any batch;
+    ``_current_sample_idx`` stays the first id for single-sample paths.
+    """
+    ctxs = [s["context"] for s in batch]
+    queries = [s["query"] for s in batch]
+    docs = [model._chunk_text(c) for c in ctxs]
+
+    model._current_sample_idx = ids[0]
+    model._current_sample_ids = list(ids)
+
+    full_answers = _batch_generate_full(model, ctxs, queries, cfg)
+    embs = _batch_compress(model, docs, queries)
+    comp_answers = _batch_generate_compressed(model, embs, queries, cfg)
+    feats = _batch_features(model, ctxs, queries, embs)
+
+    rows = []
+    for j, sample in enumerate(batch):
+        rows.append({
+            "id": ids[j],
+            "query": queries[j],
+            "gold": sample["gold"],
+            "context": ctxs[j],
+            "comp_answer": comp_answers[j],
+            "full_answer": full_answers[j],
+            "comp_correct": None,
+            "full_correct": None,
+            "tokens_full": model.count_tokens_full(ctxs[j], queries[j]),
+            "tokens_compressed": model.count_tokens_compressed(embs[j], queries[j]),
+        })
+    return list(feats), rows
+
+
+def _sort_by_id(features, results):
+    order = sorted(range(len(results)), key=lambda k: results[k]["id"])
+    return [features[k] for k in order], [results[k] for k in order]
+
+
+def _fill_missing(model, samples, features, results, upto, cfg, cache_path):
+    """Regenerate rows absent from a saved collection, ids in [0, upto).
+
+    Collections saved by the old skip_full_wrong code are missing every
+    full-wrong row. Only those rows are regenerated; saved rows keep their
+    answers and verdicts. New rows have verdicts None, so the evaluator judges
+    only them. Checkpoints keep next_idx unchanged: the saved ids alone decide
+    what is still missing, so an interrupted fill resumes where it stopped.
+    """
+    present = {r["id"] for r in results}
+    missing = [i for i in range(upto) if i not in present]
+    if not missing:
+        return features, results
+
+    log.warning("Cached collection is missing %d of %d rows (saved by an older "
+                "filtering run) — regenerating only those", len(missing), upto)
+    model.eval()
+    bs = max(1, getattr(cfg, "collect_batch_size", 1))
+    save_every = max(bs, 256)
+    since_save = 0
+
+    progress = Progress(SpinnerColumn(), TextColumn("[bold]{task.description}"),
+                        BarColumn(), MofNCompleteColumn(), TimeElapsedColumn())
+    task = progress.add_task("Filling missing rows", total=len(missing))
+    progress.start()
+    try:
+        # full batches regardless of gaps: missing rows are scattered (every
+        # full-wrong row of an old filtered run), so contiguous-only batching
+        # would degrade to batch size ~1
+        for k in range(0, len(missing), bs):
+            ids = missing[k:k + bs]
+            feats, rows = _process_batch(model, [samples[i] for i in ids], ids, cfg)
+            features.extend(feats)
+            results.extend(rows)
+            since_save += len(ids)
+            if since_save >= save_every:
+                features, results = _sort_by_id(features, results)
+                torch.save({"features": torch.stack(features), "results": results,
+                            "first_sample": samples[0], "next_idx": upto}, cache_path)
+                since_save = 0
+            progress.update(task, advance=len(ids))
+    finally:
+        progress.stop()
+
+    features, results = _sort_by_id(features, results)
+    torch.save({"features": torch.stack(features), "results": results,
+                "first_sample": samples[0], "next_idx": upto}, cache_path)
+    return features, results
+
+
 @torch.no_grad()
 def collect_features(
     model,
     samples: list[dict],
     cfg: TrainConfig,
-    evaluator: callable = None,
+    evaluator: Callable[[list[dict]], None] | None = None,
 ):
     """Run both paths on every sample, then evaluate with ``evaluator``.
 
@@ -124,7 +219,10 @@ def collect_features(
         1. Generate full + compressed answers, extract CLF features.
         2. Save incrementally to collection.pt (resume-safe).
         3. Call ``evaluator(results)`` to score all predictions in-place.
-        4. Optionally filter out samples where full answer is wrong.
+
+    Every row is kept on disk; ``skip_full_wrong`` is applied in memory by
+    ``train_router``. Rows missing from an older filtered collection are
+    regenerated automatically.
 
     Args:
         evaluator: callable(results: list[dict]) → None, scores results
@@ -151,11 +249,13 @@ def collect_features(
         else:
             features = list(cached["features"].unbind(0)) if cached["features"].dim() > 0 else []
             results = cached["results"]
-            start_idx = cached.get("next_idx", len(results))
+            start_idx = min(cached.get("next_idx", len(results)), len(samples))
+            features, results = _fill_missing(model, samples, features, results,
+                                              start_idx, cfg, cache_path)
             if start_idx >= len(samples):
                 log.info("Collection complete (%d samples), using cache", len(results))
                 if not _has_unscored(results):
-                    return cached["features"], results
+                    return torch.stack(features), results
                 # generation done but verdicts missing (e.g. judge interrupted,
                 # or labels reset): score, filter and SAVE via the same tail as
                 # a fresh run, so the verdicts are paid for once.
@@ -178,48 +278,48 @@ def collect_features(
     progress.start()
 
     bs = max(1, getattr(cfg, "collect_batch_size", 1))
+    # each save rewrites the whole collection, so saving after every batch makes
+    # total save time grow quadratically; checkpoint every ~256 samples instead
+    save_every = max(bs, 256)
+    next_idx = saved_idx = start_idx
+
+    def checkpoint():
+        nonlocal saved_idx
+        if next_idx > saved_idx:
+            torch.save({"features": torch.stack(features), "results": results,
+                        "first_sample": samples[0], "next_idx": next_idx}, cache_path)
+            saved_idx = next_idx
 
     try:
         for start in range(start_idx, len(samples), bs):
             batch = samples[start:start + bs]
-            ctxs = [s["context"] for s in batch]
-            queries = [s["query"] for s in batch]
-            docs = [model._chunk_text(c) for c in ctxs]
-
-            model._current_sample_idx = start
-
-            full_answers = _batch_generate_full(model, ctxs, queries, cfg)
-            embs = _batch_compress(model, docs, queries)
-            comp_answers = _batch_generate_compressed(model, embs, queries, cfg)
-            feats = _batch_features(model, ctxs, queries, embs)
-
-            for j, sample in enumerate(batch):
-                features.append(feats[j])
-                results.append({
-                    "id": start + j,
-                    "query": queries[j],
-                    "gold": sample["gold"],
-                    "context": ctxs[j],
-                    "comp_answer": comp_answers[j],
-                    "full_answer": full_answers[j],
-                    "comp_correct": None,
-                    "full_correct": None,
-                    "tokens_full": model.count_tokens_full(ctxs[j], queries[j]),
-                    "tokens_compressed": model.count_tokens_compressed(embs[j], queries[j]),
-                })
-
-            torch.save(
-                {"features": torch.stack(features), "results": results,
-                 "first_sample": samples[0], "next_idx": start + len(batch)},
-                cache_path,
-            )
-
+            feats, rows = _process_batch(model, batch, list(range(start, start + len(batch))), cfg)
+            features.extend(feats)
+            results.extend(rows)
+            next_idx = start + len(batch)
+            if next_idx - saved_idx >= save_every:
+                checkpoint()
             progress.update(task, advance=len(batch))
-
     finally:
+        # also on error / Ctrl-C: keep every finished batch for the resume
+        checkpoint()
         progress.stop()
 
     return _score_filter_save(model, features, results, cfg, evaluator, samples, cache_path)
+
+
+def filter_full_wrong(features, results):
+    """In-memory view without rows whose full-context answer is wrong.
+
+    Session-only: the collection on disk is never touched, so switching
+    skip_full_wrong on and off needs no re-collection.
+    """
+    keep = [i for i, r in enumerate(results) if r["full_correct"]]
+    if len(keep) < len(results):
+        log.info("skip_full_wrong: using %d/%d rows (%d with wrong full answer excluded "
+                 "for this run; collection on disk unchanged)",
+                 len(keep), len(results), len(results) - len(keep))
+    return features[keep], [results[i] for i in keep]
 
 
 def _is_unscored(r) -> bool:
@@ -233,8 +333,9 @@ def _has_unscored(results) -> bool:
 
 
 def _score_filter_save(model, features, results, cfg, evaluator, samples, cache_path):
-    """Score → filter → save. Shared by a fresh collection and by a cached one
-    whose verdicts are missing, so both end in the same on-disk state."""
+    """Score → save. Shared by a fresh collection and by a cached one whose
+    verdicts are missing. Saves EVERY row: filtering happens in memory at
+    training time (see filter_full_wrong), so no flag can delete data."""
     _eval_stages = {model.TRAIN_COLLECT: model.TRAIN_EVALUATE, model.EVAL_COLLECT: model.EVAL_EVALUATE}
     with model.enter_stage(_eval_stages.get(model.stage, model.stage)):
         log.info("Evaluating %d samples...", len(results))
@@ -244,15 +345,6 @@ def _score_filter_save(model, features, results, cfg, evaluator, samples, cache_
         raise RuntimeError(
             f"{sum(1 for r in results if _is_unscored(r))} samples still unscored after "
             f"the evaluator ran — refusing to train on partial labels")
-
-    # filter out samples where full answer is wrong
-    if cfg.skip_full_wrong:
-        keep_idx = [i for i, r in enumerate(results) if r["full_correct"]]
-        n_skipped = len(results) - len(keep_idx)
-        if n_skipped:
-            log.info("Dropped %d samples where full answer was wrong", n_skipped)
-        features = [features[i] for i in keep_idx]
-        results = [results[i] for i in keep_idx]
 
     stacked = torch.stack(features)
     torch.save({"features": stacked, "results": results,
@@ -270,7 +362,6 @@ def train_clf(
     val_features: torch.Tensor | None = None,
     val_labels: torch.Tensor | None = None,
 ) -> RouterClassifier:
-    import numpy as np
 
     d_input = features.shape[-1]
     clf = RouterClassifier(d_input=d_input, hidden=cfg.clf_hidden, dropout=cfg.clf_dropout)
@@ -345,6 +436,11 @@ def train_clf(
             log.info("Early stopping at epoch %d", epoch + 1)
             break
 
+    if best_state is None:
+        raise RuntimeError(
+            f"Classifier training produced no usable checkpoint (epochs={cfg.epochs}, "
+            f"best loss={best_loss}). The loss was NaN/inf every epoch — check the "
+            f"features for NaN/inf values, or lower the learning rate.")
     clf.load_state_dict(best_state)
     clf.eval()
     return clf
@@ -369,6 +465,12 @@ def _cv_predict(
     from sklearn.model_selection import StratifiedKFold
 
     n = len(labels)
+    n_pos = int(labels.sum())
+    if min(n_pos, n - n_pos) < n_folds:
+        raise ValueError(
+            f"Need at least {n_folds} overflow and {n_folds} non-overflow samples for "
+            f"{n_folds}-fold CV; got {n_pos} overflow / {n - n_pos} non-overflow out of "
+            f"{n}. Use more data or lower n_folds.")
     oof_probs = torch.zeros(n)
     models: list[RouterClassifier] = []
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=cfg.seed)
@@ -407,18 +509,31 @@ def _cv_predict(
 # ── Threshold policies ─────────────────────────────────────────────
 
 
+def overflow_label(r) -> float:
+    """1.0 iff the example is OVERFLOW: compressed answer wrong, full answer right.
+
+    Both-wrong examples are model errors, not compression errors, so they are
+    negatives — routing cannot fix them, and the cheaper path is compressed.
+    Compressed-right/full-wrong examples are negatives too.
+    """
+    return 1.0 if (not r["comp_correct"]) and r["full_correct"] else 0.0
+
+
 def threshold_youden(probs, results, **kwargs):
     """Youden's J statistic via ROC curve (max TPR - FPR).
 
-    Labels: 1 = overflow (compressed wrong), 0 = safe (compressed correct).
+    Labels: 1 = overflow (compressed wrong, full right), 0 = otherwise.
     High prob → likely overflow → route to full.
     """
-    import numpy as np
     from sklearn.metrics import roc_curve, roc_auc_score
 
     probs_np = np.array(probs)
-    labels = np.array([0.0 if r["comp_correct"] else 1.0 for r in results])
+    labels = np.array([overflow_label(r) for r in results])
     comp_correct = np.array([r["comp_correct"] for r in results], dtype=float)
+    # real full-context verdicts. Hardcoding 1 here was only valid on a split
+    # filtered to full-correct rows; on any other split it credits every
+    # full-routed sample as correct and can push accuracy above the oracle.
+    full_correct = np.array([r["full_correct"] for r in results], dtype=float)
     full_toks = np.array([r.get("tokens_full", 1) for r in results], dtype=float)
     comp_toks = np.array([r.get("tokens_compressed", 1) for r in results], dtype=float)
 
@@ -427,7 +542,7 @@ def threshold_youden(probs, results, **kwargs):
     t_opt = float(thresholds[np.argmax(tpr - fpr)])
 
     use_comp = probs_np <= t_opt
-    correct = np.where(use_comp, comp_correct, 1)
+    correct = np.where(use_comp, comp_correct, full_correct)
     acc = correct.mean()
     savings = 1.0 - np.where(use_comp, comp_toks, full_toks).sum() / full_toks.sum()
 
@@ -438,6 +553,11 @@ def threshold_youden(probs, results, **kwargs):
         "pct_compressed": round(float(use_comp.mean()), 4),
         "n_compressed": int(use_comp.sum()),
         "n_full": int((~use_comp).sum()),
+        # reference points on the same rows — accuracy must lie at or below
+        # acc_oracle; if it doesn't, the labels or the rows are inconsistent
+        "acc_always_compressed": round(float(comp_correct.mean()), 4),
+        "acc_always_full": round(float(full_correct.mean()), 4),
+        "acc_oracle": round(float(np.maximum(comp_correct, full_correct).mean()), 4),
     }
 
 
@@ -453,11 +573,10 @@ def eval_at_threshold(probs, results, threshold):
     always-compressed, always-full, and the oracle (pick the better path per
     sample). On an unfiltered split the oracle is below 1.0.
     """
-    import numpy as np
     from sklearn.metrics import roc_auc_score
 
     probs_np = np.array(probs)
-    labels = np.array([0.0 if r["comp_correct"] else 1.0 for r in results])
+    labels = np.array([overflow_label(r) for r in results])
     comp_correct = np.array([r["comp_correct"] for r in results], dtype=float)
     full_correct = np.array([r["full_correct"] for r in results], dtype=float)
     full_toks = np.array([r.get("tokens_full", 1) for r in results], dtype=float)
@@ -489,6 +608,24 @@ THRESHOLD_POLICIES = {
 }
 
 
+def _resolve_policy(policy):
+    """A threshold policy given by name (see THRESHOLD_POLICIES) or as a callable."""
+    if callable(policy):
+        return policy
+    try:
+        return THRESHOLD_POLICIES[policy]
+    except KeyError:
+        raise ValueError(
+            f"Unknown threshold_policy {policy!r}; choose one of "
+            f"{sorted(THRESHOLD_POLICIES)} or pass a callable") from None
+
+
+def _eval_config(cfg: TrainConfig) -> TrainConfig:
+    """Same settings, pointed at the eval split, cached under <output_dir>/eval."""
+    return dataclasses.replace(cfg, dataset=cfg.eval_dataset,
+                               output_dir=str(Path(cfg.output_dir) / "eval"))
+
+
 # ── Main entry point ────────────────────────────────────────────────
 
 
@@ -515,15 +652,11 @@ def _run_sweep(model, features, labels, results, cfg, evaluator):
     eval_features = eval_results = None
     if cfg.eval_dataset:
         with model.enter_stage(model.EVAL_COLLECT):
-            eval_cfg = TrainConfig(**{**cfg.__dict__, "dataset": cfg.eval_dataset,
-                                      "output_dir": cfg.output_dir + "/eval",
-                                      "skip_full_wrong": False})
+            eval_cfg = _eval_config(cfg)
             eval_samples = load_dataset_rows(eval_cfg)
             eval_features, eval_results = collect_features(model, eval_samples, eval_cfg, evaluator=evaluator)
 
-    policy_fn = cfg.threshold_policy
-    if isinstance(policy_fn, str):
-        policy_fn = THRESHOLD_POLICIES[policy_fn]
+    policy_fn = _resolve_policy(cfg.threshold_policy)
 
     rows = []
     for L in range(n_layers):
@@ -560,13 +693,19 @@ def _run_sweep(model, features, labels, results, cfg, evaluator):
     return {"sweep": rows, "best_layer": best["layer"], "ranked_by": key}
 
 
-def train_router(model, cfg: TrainConfig, evaluator: callable = None):
+def train_router(model, cfg: TrainConfig,
+                 evaluator: Callable[[list[dict]], None] | None = None):
     """End-to-end: collect features → evaluate → CV threshold → train CLF → save.
 
     Args:
         evaluator: callable(results) that scores predictions in-place.
             Default: EM-or-F1. For LLM judge, pass your own function.
     """
+    if cfg.push_to_hub and not cfg.hub_repo_id:
+        # checked up front: otherwise the push is skipped silently after hours of work
+        raise ValueError("push_to_hub=True needs hub_repo_id")
+    _resolve_policy(cfg.threshold_policy)  # same: fail on a typo before collecting
+
     # ── collect train features ──
     log.info("Loading train dataset from %s", cfg.dataset)
     samples = load_dataset_rows(cfg)
@@ -575,10 +714,13 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
     with model.enter_stage(model.TRAIN_COLLECT):
         features, results = collect_features(model, samples, cfg, evaluator=evaluator)
 
-    labels = torch.tensor([0.0 if r["comp_correct"] else 1.0 for r in results])
+    if cfg.skip_full_wrong:  # train split only; eval always keeps every row
+        features, results = filter_full_wrong(features, results)
+
+    labels = torch.tensor([overflow_label(r) for r in results])
     n_overflow = int(labels.sum())
     log.info(
-        "Train: %d samples — overflow (comp wrong): %d (%.1f%%)",
+        "Train: %d samples — overflow (comp wrong, full right): %d (%.1f%%)",
         len(results), n_overflow, 100 * n_overflow / max(len(results), 1),
     )
 
@@ -597,9 +739,7 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
         log.info("Running %d-fold CV (kept as ensemble)...", cfg.n_folds)
         oof_probs, fold_models = _cv_predict(features_std, labels, cfg, n_folds=cfg.n_folds)
 
-        policy_fn = cfg.threshold_policy
-        if isinstance(policy_fn, str):
-            policy_fn = THRESHOLD_POLICIES[policy_fn]
+        policy_fn = _resolve_policy(cfg.threshold_policy)
         threshold, th_stats = policy_fn(oof_probs, results, steps=cfg.threshold_steps)
         log.info("Optimal threshold (CV): %.3f — %s", threshold, th_stats)
 
@@ -613,11 +753,9 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
     eval_stats = None
     if cfg.eval_dataset:
         log.info("Loading eval dataset from %s", cfg.eval_dataset)
-        # Training stays filtered (routing can only repair comp-wrong/full-right),
-        # but the eval split keeps every sample so pipeline metrics are honest.
-        eval_cfg = TrainConfig(**{**cfg.__dict__, "dataset": cfg.eval_dataset,
-                                  "output_dir": cfg.output_dir + "/eval",
-                                  "skip_full_wrong": False})
+        # skip_full_wrong only ever filters the train split, in memory; eval
+        # keeps every sample so pipeline metrics are honest.
+        eval_cfg = _eval_config(cfg)
         eval_samples = load_dataset_rows(eval_cfg)
         log.info("Loaded %d eval samples", len(eval_samples))
 
@@ -648,7 +786,7 @@ def train_router(model, cfg: TrainConfig, evaluator: callable = None):
         )
         log.info("Saved to %s", cfg.output_dir)
 
-    if cfg.push_to_hub and cfg.hub_repo_id:
+    if cfg.push_to_hub:
         model.push_to_hub(cfg.hub_repo_id, output_dir=cfg.output_dir)
         log.info("Pushed to HF: %s", cfg.hub_repo_id)
 

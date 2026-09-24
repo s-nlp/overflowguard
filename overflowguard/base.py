@@ -38,14 +38,20 @@ Full workflow::
 from __future__ import annotations
 
 import json
+import logging
 import os
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download, HfApi
+from huggingface_hub.errors import (
+    EntryNotFoundError,
+    HFValidationError,
+    RepositoryNotFoundError,
+)
 from transformers import AutoModel, AutoTokenizer
 
 from .classifier import RouterClassifier, RouterEnsemble
@@ -53,8 +59,15 @@ from .classifier import RouterClassifier, RouterEnsemble
 _ROUTER_CONFIG = "router_config.json"
 _CLF_CHECKPOINT = "routing_clf.pt"
 
+# Raised by hf_hub_download when `path` is not a Hub repo that holds the file
+# (a local directory, a base model without a router, a missing subfolder).
+# Anything else — auth, network, corrupt JSON — is a real error and propagates.
+_NOT_ON_HUB = (EntryNotFoundError, HFValidationError, RepositoryNotFoundError)
 
-class OverflowRouter:
+log = logging.getLogger(__name__)
+
+
+class OverflowRouter(ABC):
     """Abstract base for any compress-then-route model.
 
     Provides ``self.model`` and ``self.tokenizer`` loaded automatically
@@ -98,8 +111,10 @@ class OverflowRouter:
         self._captured_hs: dict = {}
         self._hook_handle = None
         self._capture_active: bool = False
-        self.stage: str = "idle"
+        self.stage: str = self.IDLE
         self._current_sample_idx: int | None = None
+        # dataset positions of the current batch (may be non-consecutive)
+        self._current_sample_ids: list[int] | None = None
         self._stage_cache: dict[str, dict] = {}
 
     @contextmanager
@@ -150,55 +165,72 @@ class OverflowRouter:
             self.tokenizer = None
 
     @classmethod
-    def from_pretrained(cls, path: str, **kwargs):
-        """Load a router from a local dir or HF repo.
-
-        If ``path`` contains a ``router_config.json``, loads it as a
-        full router (base model from the saved path + CLF). Otherwise
-        treats ``path`` as a base model path (no CLF loaded yet — for
-        training).
-        """
+    def from_pretrained(
+        cls,
+        path: str,
+        hf_local_path: str = "",
+        **kwargs,
+    ):
         instance = cls()
 
-        # check if this is a router repo (has router_config.json)
-        config = instance._try_load_config(path)
+        config = instance._try_load_config(
+            path,
+            hf_local_path=hf_local_path,
+        )
 
         if config is not None:
-            # full router repo: load base model from stored path, then CLF
             base_path = config["base_model"]
             instance._base_model_path = base_path
             instance.model_name = base_path.split("/")[-1]
+
             instance._load_model(base_path, **kwargs)
-            instance._load_clf(path, config)
+
+            instance._load_clf(
+                path,
+                config,
+                hf_local_path=hf_local_path,
+            )
         else:
-            # bare model path: load model only (for training)
             instance._base_model_path = path
             instance.model_name = path.split("/")[-1]
             instance._load_model(path, **kwargs)
 
         return instance
 
-    def _try_load_config(self, path: str) -> dict | None:
-        """Try to load router_config.json from path. Returns None if absent."""
+    def _try_load_config(
+        self,
+        path: str,
+        hf_local_path: str = "",
+    ) -> dict | None:
+        """Load router_config.json from a Hub repo or local dir. None if absent."""
+        filename = f"{hf_local_path}/{_ROUTER_CONFIG}" if hf_local_path else _ROUTER_CONFIG
+        local = os.path.join(path, filename)
+        if os.path.exists(local):
+            return json.loads(Path(local).read_text())
         try:
-            cfg_path = hf_hub_download(repo_id=path, filename=_ROUTER_CONFIG)
-            return json.loads(Path(cfg_path).read_text())
-        except Exception:
-            local = os.path.join(path, _ROUTER_CONFIG)
-            if os.path.exists(local):
-                return json.loads(Path(local).read_text())
+            cfg_path = hf_hub_download(repo_id=path, filename=filename)
+        except _NOT_ON_HUB:
             return None
+        return json.loads(Path(cfg_path).read_text())
 
-    def _load_clf(self, path: str, config: dict):
+    def _load_clf(
+        self,
+        path: str,
+        config: dict,
+        hf_local_path: str = "",
+    ):
         """Load CLF weights from a router repo."""
-        try:
-            clf_path = hf_hub_download(repo_id=path, filename=_CLF_CHECKPOINT)
-        except Exception:
-            clf_path = os.path.join(path, _CLF_CHECKPOINT)
 
-        ckpt = torch.load(clf_path, map_location="cpu", weights_only=False)
+        filename = f"{hf_local_path}/{_CLF_CHECKPOINT}" if hf_local_path else _CLF_CHECKPOINT
+        clf_path = os.path.join(path, filename)
+        if not os.path.exists(clf_path):
+            clf_path = hf_hub_download(repo_id=path, filename=filename)
+
+        # weights_only: the checkpoint is tensors + ints/floats, and it may come
+        # from an arbitrary Hub repo — never unpickle arbitrary objects from it.
+        ckpt = torch.load(clf_path, map_location="cpu", weights_only=True)
+
         if "n_models" in ckpt:
-            # K-fold ensemble: one skeleton, one load_state_dict (weights + mu/sd)
             self.clf = RouterEnsemble.empty(
                 n_models=ckpt["n_models"],
                 d_input=ckpt["d_input"],
@@ -206,14 +238,17 @@ class OverflowRouter:
             )
             self.clf.load_state_dict(ckpt["state_dict"])
         else:
-            # legacy single classifier
             self.clf = RouterClassifier(
                 d_input=ckpt["d_input"],
                 hidden=ckpt.get("hidden", 512),
             )
             self.clf.load_state_dict(ckpt["state_dict"])
+
         self.clf.eval()
-        self.routing_threshold = config.get("threshold", ckpt.get("threshold", 0.5))
+        self.routing_threshold = config.get(
+            "threshold",
+            ckpt.get("threshold", 0.5),
+        )
 
         if self.model is not None:
             device = next(self.model.parameters()).device
@@ -257,29 +292,36 @@ class OverflowRouter:
             }
         torch.save(ckpt, os.path.join(output_dir, _CLF_CHECKPOINT))
 
-    def push_to_hub(self, repo_id: str, output_dir: str | None = None):
-        """Push router to HF Hub.
+    def push_to_hub(
+        self,
+        repo_id: str,
+        hf_local_path: str | None = None,
+        output_dir: str | None = None,
+        commit_message: str = "Upload router",
+    ):
+        """Push router config + CLF to the HF Hub as a single commit.
 
-        Saves to a temp dir (or ``output_dir``), then uploads
-        ``router_config.json`` and ``routing_clf.pt``.
+        One commit keeps the repo consistent: a failed upload can never leave a
+        new threshold next to old classifier weights. Only the two router files
+        are uploaded, even when ``output_dir`` is a training run folder that
+        also holds ``collection.pt`` (contexts, answers, features) and ``eval/``.
+        Without ``output_dir``, files are staged in a temp dir that is removed.
         """
         import tempfile
 
-        save_dir = output_dir or tempfile.mkdtemp()
-        self.save_pretrained(save_dir)
-
         api = HfApi()
         api.create_repo(repo_id, exist_ok=True)
-        api.upload_file(
-            path_or_fileobj=os.path.join(save_dir, _ROUTER_CONFIG),
-            path_in_repo=_ROUTER_CONFIG,
-            repo_id=repo_id,
-        )
-        api.upload_file(
-            path_or_fileobj=os.path.join(save_dir, _CLF_CHECKPOINT),
-            path_in_repo=_CLF_CHECKPOINT,
-            repo_id=repo_id,
-        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = output_dir or tmp
+            self.save_pretrained(save_dir)
+            api.upload_folder(
+                folder_path=save_dir,
+                repo_id=repo_id,
+                path_in_repo=hf_local_path or None,
+                allow_patterns=[_ROUTER_CONFIG, _CLF_CHECKPOINT],
+                commit_message=commit_message,
+            )
 
     # ── Required methods ────────────────────────────────────────────
 
@@ -366,7 +408,7 @@ class OverflowRouter:
         if self.model is not None:
             self.model.to("cuda")
         if self.clf is not None:
-                self.clf.to("cuda")
+            self.clf.to("cuda")
 
     def unpark_gpu(self):
         """Offload model from GPU to CPU."""
@@ -381,7 +423,9 @@ class OverflowRouter:
 
     def count_tokens_compressed(self, compressed_embs, query: str) -> int:
         """Token count for the compressed decoder input. Override if needed."""
-        return compressed_embs.shape[0] if compressed_embs.dim() == 1 else compressed_embs.shape[0] * compressed_embs.shape[1]
+        # every dim but the last (d_model) counts tokens: (d,) → 1,
+        # (n_mem, d) → n_mem, (n_chunks, n_mem, d) → n_chunks * n_mem
+        return compressed_embs.numel() // compressed_embs.shape[-1]
 
     def eval(self):
         if self.model is not None:
@@ -410,6 +454,15 @@ class OverflowRouter:
         """
         from time import perf_counter
 
+        if mode not in ("auto", "compressed", "full"):
+            raise ValueError(f"mode must be 'auto', 'compressed' or 'full', got {mode!r}")
+        if mode == "auto" and self.clf is None:
+            raise RuntimeError(
+                "No routing classifier loaded — train one, load a router repo that "
+                "contains routing_clf.pt, or pass mode='compressed'/'full'."
+            )
+
+        # without a query, the start of the text stands in as the prompt
         q = query or text[:100]
         th = threshold if threshold is not None else self.routing_threshold
 
@@ -423,12 +476,11 @@ class OverflowRouter:
         }
 
         t0 = perf_counter()
-        clf_prob = self.clf.predict(self.extract_clf_features(compressed_embs, q)).item()
+        clf_prob = None
+        if self.clf is not None:
+            clf_prob = self.clf.predict(self.extract_clf_features(compressed_embs, q)).item()
 
-        if mode == "auto":
-            use_comp = clf_prob <= th
-        else:
-            use_comp = mode == "compressed"
+        use_comp = clf_prob <= th if mode == "auto" else mode == "compressed"
 
         route_mode = "compressed" if use_comp else "full"
         yield {
@@ -460,7 +512,7 @@ class OverflowRouter:
             "result": {
                 "prediction": prediction,
                 "mode": route_mode,
-                "clf_prob": round(clf_prob, 4),
+                "clf_prob": None if clf_prob is None else round(clf_prob, 4),
                 "tokens_full": tokens_full,
                 "tokens_compressed": tokens_compressed,
                 "tokens_saved": tokens_saved,

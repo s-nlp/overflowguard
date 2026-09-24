@@ -196,8 +196,7 @@ class XragRouter(OverflowRouter):
         """Tokenize a batch of prompts. The tokenizer is already configured
         padding_side='left', which is what a decoder-only model needs: real
         tokens are flush right, so the last one is at index -1 for every row."""
-        enc = self.tokenizer(prompts, return_tensors="pt", padding=True,
-                             add_special_tokens=False)
+        enc = self.tokenizer(prompts, return_tensors="pt", padding=True)
         dev = self.model.device
         return enc["input_ids"].to(dev), enc["attention_mask"].to(dev)
 
@@ -324,12 +323,13 @@ if __name__ == "__main__":
     router = XragRouter.from_pretrained("Hannibal046/xrag-7b")
 
     cfg = TrainConfig(
-        dataset="./triviaqa/train.jsonl",
-        eval_dataset="./triviaqa/test.jsonl",
-        output_dir="./xrag_mistral_router_ckpt_triviaqa",
+            dataset="./hotpotqa/train.jsonl",
+        eval_dataset="./hotpotqa/test.jsonl",
+        output_dir="./xrag_mistral-7b_router_ckpt_hotpotqa",
         epochs=60,
         n_folds=5,
         collect_batch_size=32,
+        skip_full_wrong=False,
         push_to_hub=False,
         hub_repo_id="wexumin/xrag-7b-router",
     )

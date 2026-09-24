@@ -1,5 +1,6 @@
 import logging
 import torch
+from jinja2.exceptions import TemplateError
 from transformers import AutoModel
 from overflowguard import OverflowRouter, TrainConfig, train_router
 from openai import OpenAI
@@ -8,6 +9,11 @@ import os
 logging.basicConfig(level=logging.INFO)
 
 
+
+class StopForward(Exception):
+    """Raised by the mid-layer hook once the feature is captured, so the
+    decoder skips every layer above it (early exit)."""
+
 class PiscoRouter(OverflowRouter):
 
     MID_LAYER = 17
@@ -15,6 +21,7 @@ class PiscoRouter(OverflowRouter):
     def _load_model(self, path, **kwargs):
         self.model = AutoModel.from_pretrained(path, trust_remote_code=True).eval()
         self.tokenizer = self.model.decoder_tokenizer
+        self.early_exit = True  # stop the extraction forward at MID_LAYER
         self._attach_mid_hook()
         self._judge_client = None
     def _get_judge(self):
@@ -35,6 +42,8 @@ class PiscoRouter(OverflowRouter):
             h = out[0] if isinstance(out, tuple) else out
             self._captured_hs["h"] = h.detach()
             self._capture_active = False
+            if self.early_exit:
+                raise StopForward  # skip the layers above the probed one
 
         self._hook_handle = layers[mid].register_forward_hook(hook)
 
@@ -74,12 +83,17 @@ class PiscoRouter(OverflowRouter):
         inputs_embeds = self.model.replace_emb(
             compressed_embs, ids["input_ids"].to(dev),
         )
+        if "decoder_adapter" in self.model.adapter_keys:
+            self.model.decoder.set_adapter("decoder_adapter")
         self._capture_active = True
         self._captured_hs.clear()
-        _ = self.model.decoder(
-            inputs_embeds=inputs_embeds,
-            attention_mask=ids["attention_mask"].to(dev),
-        )
+        try:
+            self.model.decoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=ids["attention_mask"].to(dev),
+            )
+        except StopForward:
+            pass
 
         return self._captured_hs["h"][0, -1, :].float()
 
@@ -125,18 +139,18 @@ class PiscoRouter(OverflowRouter):
         return self.tokenizer.batch_decode(out, skip_special_tokens=True)
 
     @torch.no_grad()
-    def compress_batch(self, chunked, queries=None):
-        """One compress_documents call over all chunks of all samples.
+    def compress_batch(self, docs, queries=None):
+        """One compress_documents call over every document of every sample.
 
-        PISCO compresses each chunk independently, so flattening the batch is
-        exact; we just split the result back per sample.
+        PISCO compresses each document independently, so flattening the batch
+        is exact; we just split the result back per sample.
         """
-        flat = [c for chunks in chunked for c in chunks]
+        flat = [d for per_sample in docs for d in per_sample]
         embs = self.model.compress_documents(documents=flat)
         out, i = [], 0
-        for chunks in chunked:
-            out.append(embs[i:i + len(chunks)])
-            i += len(chunks)
+        for per_sample in docs:
+            out.append(embs[i:i + len(per_sample)])
+            i += len(per_sample)
         return out
 
     @torch.no_grad()
@@ -184,8 +198,6 @@ class PiscoRouter(OverflowRouter):
             ids = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
             rows.append(self.model.replace_emb(emb, ids["input_ids"].to(dev))[0])
 
-        # Pads carry the PAD-TOKEN embedding, not zeros: with left padding real
-        # tokens attend back over them, so pad content must match training.
         d = rows[0].size(-1)
         pad_emb = self.model.decoder.get_input_embeddings()(
             torch.tensor([self._pad_id], device=dev)).view(1, 1, d)
@@ -225,25 +237,21 @@ class PiscoRouter(OverflowRouter):
 
 if __name__ == "__main__":
     # load bare model (no router_config.json → just loads the model)
-    router = PiscoRouter.from_pretrained("naver/pisco-mistral")
+    router = PiscoRouter.from_pretrained("naver/pisco-solar")
     router.park_gpu()
 
     cfg = TrainConfig(
         dataset="./squad/train.jsonl",
         eval_dataset="./squad/test.jsonl", # {"context": ..., "query": ..., "gold": ...}
-        output_dir="./pisco_router_ckpt",
+        output_dir="./pisco_solar-7b_router_ckpt_squad",
         epochs=60,
         n_folds=5,
+        skip_full_wrong=False,
         collect_batch_size=32,
         push_to_hub=False,
         hub_repo_id="wexumin/pisco-7b-router",
     )
 
-
-    # result = {"threshold": 0.62, "auc": 0.87, "accuracy": 0.91, ...}
-    # default — EM/F1, no API calls
-
-    # LLM judge — async, concurrent, with progress bar
     from overflowguard import llm_judge
 
 
